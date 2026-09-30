@@ -23,6 +23,9 @@ class CMSRepository:
     async def faq(self, item_id: int) -> FAQItem | None:
         return await self.session.get(FAQItem, item_id)
 
+    async def faq_questions(self) -> set[str]:
+        return set((await self.session.scalars(select(FAQItem.question))).all())
+
     async def admins(self) -> list[Admin]:
         return list((await self.session.scalars(select(Admin).order_by(Admin.id))).all())
 

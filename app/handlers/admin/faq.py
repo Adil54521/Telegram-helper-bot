@@ -1,16 +1,24 @@
+import io
+from datetime import date
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.callbacks import AdminMenuCallback, FAQCallback
 from app.config import Settings
+from app.ai.service import AIService
 from app.database.repositories.cms import CMSRepository
+from app.database.repositories.users import upsert_user
 from app.database.models.enums import LanguageCode
 from app.services.cms import FAQService
 from app.services.permissions import Permission, PermissionService
-from app.states.admin import AddFAQ, EditFAQ
+from app.states.admin import AddFAQ, EditFAQ, ImportFAQ
+from app.services.faq_csv import FAQCSVRow, export_faq_csv, faq_template_csv, normalize_question, parse_faq_csv
 from app.utils.telegram import safe_edit_text
+from app.utils.telegram import safe_delete_message
+from app.utils.wizard import consume_input, edit_wizard, finish_wizard, remember_wizard
 from app.utils.presentation import html_text, text_preview
 
 router=Router(name="admin_faq"); SIZE=8
@@ -25,7 +33,7 @@ async def listing(cb,session,page=0):
     active_count=sum(1 for item in items if item.is_active)
     rows=[[InlineKeyboardButton(text=f"{x.position+1}. {'🔴 ' if not x.is_active else ''}{text_preview(x.question,40)}",callback_data=FAQCallback(action="open",item_id=x.id,page=page).pack())] for x in chunk]
     if pages>1:rows.append([InlineKeyboardButton(text="⬅️",callback_data=FAQCallback(action="list",page=max(0,page-1)).pack()),InlineKeyboardButton(text=f"{page+1} / {pages}",callback_data="noop"),InlineKeyboardButton(text="➡️",callback_data=FAQCallback(action="list",page=min(pages-1,page+1)).pack())])
-    rows += [[InlineKeyboardButton(text="➕ Добавить вопрос",callback_data=FAQCallback(action="add").pack())],[InlineKeyboardButton(text="⬅️ Панель",callback_data=AdminMenuCallback(section="dashboard").pack())]]
+    rows += [[InlineKeyboardButton(text="➕ Добавить вопрос",callback_data=FAQCallback(action="add").pack())],[InlineKeyboardButton(text="📥 Импорт CSV",callback_data=FAQCallback(action="import").pack()),InlineKeyboardButton(text="📤 Экспорт CSV",callback_data=FAQCallback(action="export").pack())],[InlineKeyboardButton(text="📄 Скачать шаблон",callback_data=FAQCallback(action="template").pack())],[InlineKeyboardButton(text="⬅️ Панель",callback_data=AdminMenuCallback(section="dashboard").pack())]]
     if cb.message:await safe_edit_text(cb.message,f"❓ <b>FAQ</b>\n\nВсего вопросов: <b>{len(items)}</b>\n🟢 Активных: <b>{active_count}</b>\n🔴 Выключено: <b>{len(items)-active_count}</b>\n\nВыберите вопрос:",reply_markup=kb(rows));await cb.answer()
 
 @router.callback_query(AdminMenuCallback.filter(F.section=="faq"))
@@ -42,40 +50,283 @@ async def open_(cb:CallbackQuery,callback_data:FAQCallback,session:AsyncSession,
     rows=[[InlineKeyboardButton(text="🇷🇺 Редактировать RU",callback_data=FAQCallback(action="edit_q_ru",item_id=x.id).pack()),InlineKeyboardButton(text="🇰🇿 Редактировать KK",callback_data=FAQCallback(action="edit_q_kk",item_id=x.id).pack())],[InlineKeyboardButton(text="🇷🇺 Изменить ответ",callback_data=FAQCallback(action="edit_a_ru",item_id=x.id).pack()),InlineKeyboardButton(text="🇰🇿 Жауапты өзгерту",callback_data=FAQCallback(action="edit_a_kk",item_id=x.id).pack())],[InlineKeyboardButton(text="⬆️ Выше",callback_data=FAQCallback(action="up",item_id=x.id).pack()),InlineKeyboardButton(text="⬇️ Ниже",callback_data=FAQCallback(action="down",item_id=x.id).pack())],[InlineKeyboardButton(text="🔴 Выключить" if x.is_active else "🟢 Включить",callback_data=FAQCallback(action="toggle",item_id=x.id).pack())],[InlineKeyboardButton(text="🗑 Удалить",callback_data=FAQCallback(action="delete_ask",item_id=x.id).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=FAQCallback(action="list").pack())]]
     ru=next((v for v in x.translations if v.language_code==LanguageCode.RU),None);kk=next((v for v in x.translations if v.language_code==LanguageCode.KK),None)
     ru_q,ru_a=(ru.question,ru.answer) if ru else (x.question,x.answer)
+    if not kk:
+        rows.insert(2, [InlineKeyboardButton(text="✨ Создать перевод KK", callback_data=FAQCallback(action="ai_one", item_id=x.id).pack())])
     kk_block=(f"<b>Сұрақ:</b>\n{html_text(kk.question)}\n\n<b>Жауап:</b>\n{html_text(text_preview(kk.answer))}" if kk else "Перевод отсутствует")
     card=(f"❓ <b>FAQ</b>\n\n{'🟢 Активен' if x.is_active else '🔴 Выключен'}\n\n🇷🇺 <b>Русский</b>\n\n<b>Вопрос:</b>\n{html_text(ru_q)}\n\n<b>Ответ:</b>\n{html_text(text_preview(ru_a))}\n\n🇰🇿 <b>Қазақша{' ⚠️' if not kk else ''}</b>\n\n{kk_block}\n\n📍 Позиция: {x.position+1}")
     if cb.message:await safe_edit_text(cb.message,card,reply_markup=kb(rows));await cb.answer()
 
+
+@router.callback_query(FAQCallback.filter(F.action == "template"))
+async def download_template(cb: CallbackQuery, session: AsyncSession, settings: Settings) -> None:
+    if not await guard(cb, session, settings): return
+    await cb.message.answer_document(BufferedInputFile(faq_template_csv(), filename="faq_template.csv"))
+    await cb.answer()
+
+
+@router.callback_query(FAQCallback.filter(F.action == "export"))
+async def export_csv(cb: CallbackQuery, session: AsyncSession, settings: Settings) -> None:
+    if not await guard(cb, session, settings): return
+    content = export_faq_csv(await CMSRepository(session).faqs())
+    await cb.message.answer_document(BufferedInputFile(content, filename=f"faq_export_{date.today().isoformat()}.csv"))
+    await cb.answer()
+
+
+@router.callback_query(FAQCallback.filter(F.action == "import"))
+async def begin_import(cb: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
+    if not await guard(cb, session, settings): return
+    await state.set_state(ImportFAQ.file)
+    await cb.message.answer("📥 <b>Импорт FAQ</b>\n\nОтправьте CSV-файл.\n\nОбязательные столбцы:\n<code>question_ru</code>\n<code>answer_ru</code>\n\nДополнительно:\n<code>question_kk</code>\n<code>answer_kk</code>\n<code>is_active</code>", reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена", callback_data=FAQCallback(action="import_cancel").pack())]]))
+    await cb.answer()
+
+
+@router.message(ImportFAQ.file)
+async def receive_import(message: Message, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
+    if not message.from_user or not await ok(message.from_user.id, session, settings):
+        await state.clear(); return
+    document = message.document
+    if not document or not (document.file_name or "").casefold().endswith(".csv"):
+        return await message.answer("Отправьте документ с расширением .csv.")
+    if document.file_size and document.file_size > 1_000_000:
+        return await message.answer("CSV-файл слишком большой (максимум 1 МБ).")
+    stream = io.BytesIO()
+    await message.bot.download(document, destination=stream)
+    try:
+        preview = parse_faq_csv(stream.getvalue(), await CMSRepository(session).faq_questions())
+    except ValueError as error:
+        return await message.answer(f"❌ {html_text(str(error))}")
+    await state.update_data(
+        import_rows=[row.to_fsm() for row in preview.new_rows],
+        import_duplicates=[row.to_fsm() for row in preview.duplicates],
+        import_errors=[error.to_fsm() for error in preview.errors],
+        import_total=preview.total_rows,
+    )
+    await state.set_state(ImportFAQ.preview)
+    with_kk = sum(1 for row in preview.new_rows if row.question_kk and row.answer_kk)
+    rows = []
+    if preview.errors: rows.append([InlineKeyboardButton(text="👁 Ошибки", callback_data=FAQCallback(action="import_errors").pack())])
+    if preview.duplicates: rows.append([InlineKeyboardButton(text="♻️ Дубликаты", callback_data=FAQCallback(action="import_duplicates").pack())])
+    if preview.new_rows: rows.append([InlineKeyboardButton(text=f"✅ Импортировать {len(preview.new_rows)}", callback_data=FAQCallback(action="import_confirm").pack())])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=FAQCallback(action="import_cancel").pack())])
+    await message.answer(f"📥 <b>Проверка FAQ CSV</b>\n\nВсего строк: <b>{preview.total_rows}</b>\n✅ Новых: <b>{len(preview.new_rows)}</b>\n♻️ Дубликатов: <b>{len(preview.duplicates)}</b>\n❌ Ошибок: <b>{len(preview.errors)}</b>\n\n🇷🇺 RU: <b>{len(preview.new_rows)}</b>\n🇰🇿 С KK: <b>{with_kk}</b>\n⚠️ Без KK: <b>{len(preview.new_rows)-with_kk}</b>", reply_markup=kb(rows))
+
+
+@router.callback_query(ImportFAQ.preview, FAQCallback.filter(F.action.in_({"import_errors", "import_duplicates"})))
+async def import_details(cb: CallbackQuery, callback_data: FAQCallback, state: FSMContext) -> None:
+    data = await state.get_data()
+    if callback_data.action == "import_errors":
+        values = data.get("import_errors", [])
+        title = "❌ <b>Ошибки</b>"
+        lines = [f"Строка {value['row_number']}:\n{html_text(str(value['message']))}" for value in values[:30]]
+    else:
+        values = data.get("import_duplicates", [])
+        title = "♻️ <b>Дубликаты</b>"
+        lines = [f"Строка {value['row_number']}: {html_text(text_preview(str(value['question_ru']), 80))}" for value in values[:30]]
+    suffix = f"\n\n… ещё {len(values)-30}" if len(values) > 30 else ""
+    await cb.message.answer(title + "\n\n" + "\n\n".join(lines) + suffix)
+    await cb.answer()
+
+
+@router.callback_query(ImportFAQ.preview, FAQCallback.filter(F.action == "import_confirm"))
+async def confirm_import(cb: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
+    if not await guard(cb, session, settings): await state.clear(); return
+    data = await state.get_data(); raw_rows = data.get("import_rows", [])
+    if not raw_rows: return await cb.answer("Нет новых строк для импорта", show_alert=True)
+    existing = {normalize_question(value) for value in await CMSRepository(session).faq_questions()}
+    missing_ids: list[int] = []; added = skipped = 0
+    service = FAQService(session)
+    for raw in raw_rows:
+        row = FAQCSVRow(**raw)
+        normalized = normalize_question(row.question_ru)
+        if normalized in existing:
+            skipped += 1; continue
+        item = await service.create(cb.from_user.id, row.question_ru, row.answer_ru, row.question_kk or None, row.answer_kk or None, is_active=row.is_active)
+        await session.flush(); existing.add(normalized); added += 1
+        if not row.question_kk: missing_ids.append(item.id)
+    await state.update_data(translation_faq_ids=missing_ids)
+    await state.set_state(ImportFAQ.translation_preview if missing_ids else None)
+    rows = []
+    if missing_ids: rows.append([InlineKeyboardButton(text=f"✨ Создать KK для {len(missing_ids)}", callback_data=FAQCallback(action="ai_generate").pack())])
+    rows.append([InlineKeyboardButton(text="⬅️ FAQ", callback_data=FAQCallback(action="list").pack())])
+    await cb.message.answer(f"✅ <b>Импорт завершён</b>\n\nДобавлено: <b>{added}</b>\n♻️ Пропущено дубликатов: <b>{len(data.get('import_duplicates', []))+skipped}</b>\n⚠️ Без KK: <b>{len(missing_ids)}</b>", reply_markup=kb(rows))
+    await cb.answer()
+
+
+@router.callback_query(FAQCallback.filter(F.action == "import_cancel"))
+async def cancel_import(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear(); await cb.answer("Импорт отменён", show_alert=True)
+
+
+async def show_ai_preview(cb: CallbackQuery, state: FSMContext, page: int = 0) -> None:
+    data = await state.get_data(); values = data.get("ai_faq_translations", [])
+    pages = max(1, (len(values) + 4) // 5); page = max(0, min(page, pages - 1))
+    chunk = values[page * 5:(page + 1) * 5]
+    body = []
+    rows = []
+    for index, value in enumerate(chunk, start=page * 5 + 1):
+        body.append(f"<b>{index}.</b>\n🇷🇺 {html_text(text_preview(value['question_ru'], 100))}\n🇰🇿 {html_text(text_preview(value['question_kk'], 100))}")
+        rows.append([InlineKeyboardButton(text=f"✏️ {index}. {text_preview(value['question_ru'], 30)}", callback_data=FAQCallback(action="ai_open", item_id=value["faq_id"], page=page).pack())])
+    if pages > 1:
+        rows.append([InlineKeyboardButton(text="⬅️", callback_data=FAQCallback(action="ai_preview", page=max(0, page-1)).pack()), InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="noop"), InlineKeyboardButton(text="➡️", callback_data=FAQCallback(action="ai_preview", page=min(pages-1, page+1)).pack())])
+    rows.extend([[InlineKeyboardButton(text="✅ Сохранить KK", callback_data=FAQCallback(action="ai_save").pack())], [InlineKeyboardButton(text="❌ Отмена", callback_data=FAQCallback(action="import_cancel").pack())]])
+    await state.set_state(ImportFAQ.translation_preview)
+    if cb.message: await safe_edit_text(cb.message, f"✨ <b>AI-переводы FAQ</b>\n\nГотово: <b>{len(values)}</b>\n\n" + "\n\n".join(body), reply_markup=kb(rows))
+    await cb.answer()
+
+
+@router.callback_query(FAQCallback.filter(F.action.in_({"ai_generate", "ai_one"})))
+async def generate_ai_faq(cb: CallbackQuery, callback_data: FAQCallback, session: AsyncSession, settings: Settings, state: FSMContext, ai_service: AIService | None) -> None:
+    if not await guard(cb, session, settings): return
+    if not settings.ai_available or ai_service is None: return await cb.answer("Gemini недоступен", show_alert=True)
+    if callback_data.action == "ai_one":
+        ids = [callback_data.item_id]
+    else:
+        ids = list((await state.get_data()).get("translation_faq_ids", []))
+    pending = []
+    for faq_id in ids:
+        item = await CMSRepository(session).faq(int(faq_id))
+        if item and not any(value.language_code == LanguageCode.KK for value in item.translations):
+            pending.append({"faq_id": item.id, "question_ru": item.question, "answer_ru": item.answer})
+    if not pending: return await cb.answer("FAQ без KK-перевода не найдены", show_alert=True)
+    user = await upsert_user(session, cb.from_user)
+    translated = []
+    try:
+        batches: list[list[dict[str, object]]] = []
+        batch: list[dict[str, object]] = []; batch_size = 0
+        for value in pending:
+            value_size = len(str(value["question_ru"])) + len(str(value["answer_ru"]))
+            if batch and (len(batch) >= 8 or batch_size + value_size > 10_000):
+                batches.append(batch); batch = []; batch_size = 0
+            batch.append(value); batch_size += value_size
+        if batch: batches.append(batch)
+        for batch in batches:
+            results = await ai_service.translate_faq_batch(session, user_id=user.id, rows=batch)
+            for source, result in zip(batch, results, strict=True):
+                translated.append({**source, "question_kk": result.question_kk.strip(), "answer_kk": result.answer_kk.strip()})
+    except Exception:
+        return await cb.answer("Gemini не смог подготовить корректный перевод", show_alert=True)
+    await state.update_data(ai_faq_translations=translated)
+    await show_ai_preview(cb, state)
+
+
+@router.callback_query(ImportFAQ.translation_preview, FAQCallback.filter(F.action == "ai_preview"))
+async def ai_preview_page(cb: CallbackQuery, callback_data: FAQCallback, state: FSMContext) -> None:
+    await show_ai_preview(cb, state, callback_data.page)
+
+
+@router.callback_query(ImportFAQ.translation_preview, FAQCallback.filter(F.action == "ai_open"))
+async def ai_open_translation(cb: CallbackQuery, callback_data: FAQCallback, state: FSMContext) -> None:
+    values = (await state.get_data()).get("ai_faq_translations", [])
+    value = next((item for item in values if item["faq_id"] == callback_data.item_id), None)
+    if not value: return await cb.answer("Перевод не найден", show_alert=True)
+    rows = [[InlineKeyboardButton(text="✏️ Изменить сұрақ", callback_data=FAQCallback(action="ai_edit_q", item_id=value["faq_id"], page=callback_data.page).pack())], [InlineKeyboardButton(text="✏️ Изменить жауап", callback_data=FAQCallback(action="ai_edit_a", item_id=value["faq_id"], page=callback_data.page).pack())], [InlineKeyboardButton(text="⬅️ Назад", callback_data=FAQCallback(action="ai_preview", page=callback_data.page).pack())]]
+    await safe_edit_text(cb.message, f"✨ <b>Предложенный перевод</b>\n\n🇷🇺 <b>Вопрос:</b>\n{html_text(value['question_ru'])}\n\n🇰🇿 <b>Сұрақ:</b>\n{html_text(value['question_kk'])}\n\n🇷🇺 <b>Ответ:</b>\n{html_text(text_preview(value['answer_ru']))}\n\n🇰🇿 <b>Жауап:</b>\n{html_text(text_preview(value['answer_kk']))}", reply_markup=kb(rows)); await cb.answer()
+
+
+@router.callback_query(ImportFAQ.translation_preview, FAQCallback.filter(F.action.in_({"ai_edit_q", "ai_edit_a"})))
+async def begin_ai_edit(cb: CallbackQuery, callback_data: FAQCallback, state: FSMContext) -> None:
+    await state.update_data(ai_edit_id=callback_data.item_id, ai_edit_field="question_kk" if callback_data.action.endswith("q") else "answer_kk", ai_edit_page=callback_data.page)
+    await state.set_state(ImportFAQ.translation_edit)
+    await cb.message.answer("Введите исправленный перевод:"); await cb.answer()
+
+
+@router.message(ImportFAQ.translation_edit, F.text)
+async def receive_ai_edit(message: Message, state: FSMContext) -> None:
+    data = await state.get_data(); values = data.get("ai_faq_translations", [])
+    for value in values:
+        if value["faq_id"] == data.get("ai_edit_id"): value[data["ai_edit_field"]] = message.text.strip()
+    await state.update_data(ai_faq_translations=values)
+    await state.set_state(ImportFAQ.translation_preview)
+    await message.answer("✅ Изменение сохранено в предпросмотре. Нажмите «Сохранить KK» для записи в БД.")
+
+
+@router.callback_query(ImportFAQ.translation_preview, FAQCallback.filter(F.action == "ai_save"))
+async def save_ai_faq(cb: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
+    if not await guard(cb, session, settings): await state.clear(); return
+    values = (await state.get_data()).get("ai_faq_translations", []); saved = skipped = 0
+    for value in values:
+        item = await CMSRepository(session).faq(value["faq_id"])
+        if not item or any(translation.language_code == LanguageCode.KK for translation in item.translations):
+            skipped += 1; continue
+        await FAQService(session).update_translation(cb.from_user.id, item, LanguageCode.KK, question=value["question_kk"], answer=value["answer_kk"]); saved += 1
+    await state.clear()
+    await cb.message.answer(f"✅ KK-переводы сохранены: <b>{saved}</b>" + (f"\nПропущено: <b>{skipped}</b>" if skipped else ""), reply_markup=kb([[InlineKeyboardButton(text="⬅️ FAQ", callback_data=FAQCallback(action="list").pack())]])); await cb.answer()
+
 @router.callback_query(FAQCallback.filter(F.action=="add"))
 async def add(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext):
-    if await guard(cb,session,settings):await state.set_state(AddFAQ.question);await cb.message.answer("Введите вопрос:");await cb.answer()
+    if not await guard(cb,session,settings):return
+    await state.set_state(AddFAQ.question);await state.update_data(faq_question=None,faq_answer=None,faq_question_kk=None,faq_answer_kk=None)
+    await remember_wizard(state,cb.message)
+    await safe_edit_text(cb.message,"➕ <b>Новый FAQ</b>\n\nШаг 1 из 4\n🇷🇺 <b>Вопрос</b>\n\nОтправьте вопрос на русском языке.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]));await cb.answer()
 @router.message(AddFAQ.question)
 async def question(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
-    if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
-    if not m.text:return await m.answer("Отправьте текст вопроса.")
-    await state.update_data(question=m.text);await state.set_state(AddFAQ.answer);await m.answer("Введите ответ:")
+    if not m.from_user or not await ok(m.from_user.id,session,settings):return
+    value=(m.text or "").strip()
+    if not value or len(value)>500:return
+    await state.update_data(faq_question=value);await consume_input(m);await state.set_state(AddFAQ.answer)
+    await edit_wizard(m.bot,state,f"➕ <b>Новый FAQ</b>\n\nШаг 2 из 4\n🇷🇺 <b>Ответ</b>\n\n❓ Вопрос:\n{html_text(text_preview(value,120))}\n\nОтправьте ответ на русском языке.",kb([[InlineKeyboardButton(text="⬅️ Назад",callback_data=FAQCallback(action="create_back_q").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]))
 @router.message(AddFAQ.answer)
 async def answer(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
-    if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
-    if not m.text:return await m.answer("Отправьте текст ответа.")
-    await state.update_data(answer=m.text);await state.set_state(AddFAQ.question_kk);await m.answer("Введите вопрос 🇰🇿:")
+    if not m.from_user or not await ok(m.from_user.id,session,settings):return
+    value=(m.text or "").strip()
+    if not value or len(value)>10000:return
+    await state.update_data(faq_answer=value);await consume_input(m);await state.set_state(AddFAQ.question_kk)
+    await show_kk_choice(m.bot,state)
+
+async def show_kk_choice(bot,state):
+    await state.set_state(AddFAQ.question_kk)
+    await edit_wizard(bot,state,"➕ <b>Новый FAQ</b>\n\nШаг 3 из 4\n🇰🇿 <b>Қазақша</b>\n\nРусская версия заполнена.\n\nКак добавить казахский перевод?",kb([[InlineKeyboardButton(text="✍️ Ввести вручную",callback_data=FAQCallback(action="create_manual_kk").pack())],[InlineKeyboardButton(text="✨ Создать через Gemini",callback_data=FAQCallback(action="create_ai_kk").pack())],[InlineKeyboardButton(text="⏭ Без KK",callback_data=FAQCallback(action="create_skip_kk").pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=FAQCallback(action="create_back_a").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]))
+
+@router.callback_query(FAQCallback.filter(F.action=="create_manual_kk"))
+async def manual_kk(cb:CallbackQuery,state:FSMContext):
+    await state.set_state(AddFAQ.question_kk);await safe_edit_text(cb.message,"➕ <b>Новый FAQ</b>\n\nШаг 3 из 4\n🇰🇿 <b>Сұрақ</b>\n\nОтправьте вопрос на казахском языке.",reply_markup=kb([[InlineKeyboardButton(text="⬅️ Назад",callback_data=FAQCallback(action="create_kk_choice").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]));await cb.answer()
+
+@router.callback_query(FAQCallback.filter(F.action=="create_ai_kk"))
+async def create_ai_kk(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext,ai_service:AIService|None):
+    if not settings.ai_available or ai_service is None:return await cb.answer("Gemini недоступен",show_alert=True)
+    d=await state.get_data();await safe_edit_text(cb.message,"✨ <b>Создаю казахский перевод...</b>")
+    user=await upsert_user(session,cb.from_user)
+    try:
+        result=(await ai_service.translate_faq_batch(session,user_id=user.id,rows=[{"question_ru":d["faq_question"],"answer_ru":d["faq_answer"]}]))[0]
+    except Exception:
+        await safe_edit_text(cb.message,"⚠️ <b>Не удалось создать перевод.</b>",reply_markup=kb([[InlineKeyboardButton(text="🔄 Попробовать ещё раз",callback_data=FAQCallback(action="create_ai_kk").pack())],[InlineKeyboardButton(text="✍️ Ввести вручную",callback_data=FAQCallback(action="create_manual_kk").pack())],[InlineKeyboardButton(text="⏭ Без KK",callback_data=FAQCallback(action="create_skip_kk").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]));return await cb.answer()
+    await state.update_data(faq_question_kk=result.question_kk,faq_answer_kk=result.answer_kk);await show_create_preview(cb.bot,state);await cb.answer()
 @router.message(AddFAQ.question_kk)
 async def question_kk(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
-    if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
-    if not m.text:return await m.answer("Отправьте текст.")
-    await state.update_data(question_kk=m.text);await state.set_state(AddFAQ.answer_kk);await m.answer("Введите ответ 🇰🇿:")
+    if not m.from_user or not await ok(m.from_user.id,session,settings):return
+    value=(m.text or "").strip()
+    if not value or len(value)>500:return
+    await state.update_data(faq_question_kk=value);await consume_input(m);await state.set_state(AddFAQ.answer_kk)
+    await edit_wizard(m.bot,state,f"➕ <b>Новый FAQ</b>\n\nШаг 4 из 4\n🇰🇿 <b>Жауап</b>\n\n❓ Сұрақ:\n{html_text(text_preview(value,120))}\n\nОтправьте ответ на казахском языке.",kb([[InlineKeyboardButton(text="⬅️ Назад",callback_data=FAQCallback(action="create_manual_kk").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]))
 @router.message(AddFAQ.answer_kk)
 async def answer_kk(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
-    if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
-    if not m.text:return await m.answer("Отправьте текст.")
-    d=await state.get_data();await state.update_data(answer_kk=m.text);await state.set_state(AddFAQ.confirm)
-    await m.answer(f"<b>Предпросмотр FAQ</b>\n\n🇷🇺 {html_text(d['question'])}\n{html_text(d['answer'])}\n\n🇰🇿 {html_text(d['question_kk'])}\n{html_text(m.text)}",reply_markup=kb([[InlineKeyboardButton(text="✅ Создать",callback_data=FAQCallback(action="create").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="cancel").pack())]]))
+    if not m.from_user or not await ok(m.from_user.id,session,settings):return
+    value=(m.text or "").strip()
+    if not value or len(value)>10000:return
+    await state.update_data(faq_answer_kk=value);await consume_input(m);await show_create_preview(m.bot,state)
+
+async def show_create_preview(bot,state):
+    d=await state.get_data();await state.set_state(AddFAQ.confirm)
+    kk=(f"❓ Сұрақ:\n{html_text(d['faq_question_kk'])}\n\n💬 Жауап:\n{html_text(text_preview(d['faq_answer_kk']))}" if d.get('faq_question_kk') and d.get('faq_answer_kk') else "⚠️ Перевод отсутствует")
+    await edit_wizard(bot,state,f"👁 <b>Предпросмотр FAQ</b>\n\n🇷🇺 <b>Русский</b>\n\n❓ Вопрос:\n{html_text(d['faq_question'])}\n\n💬 Ответ:\n{html_text(text_preview(d['faq_answer']))}\n\n🇰🇿 <b>Қазақша{' ⚠️' if not d.get('faq_question_kk') else ''}</b>\n\n{kk}\n\n🟢 Статус: Активен",kb([[InlineKeyboardButton(text="✏️ Изменить RU",callback_data=FAQCallback(action="create_edit_ru").pack()),InlineKeyboardButton(text="✏️ Изменить KK",callback_data=FAQCallback(action="create_kk_choice").pack())],[InlineKeyboardButton(text="✅ Создать FAQ",callback_data=FAQCallback(action="create").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]))
 @router.callback_query(AddFAQ.confirm,FAQCallback.filter(F.action=="create"))
 async def create(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext):
-    if not await guard(cb,session,settings):await state.clear();return
-    d=await state.get_data();await FAQService(session).create(cb.from_user.id,d["question"],d["answer"],d.get("question_kk"),d.get("answer_kk"));await state.clear();await listing(cb,session)
-@router.callback_query(FAQCallback.filter(F.action=="cancel"))
-async def cancel(cb:CallbackQuery,state:FSMContext):await state.clear();await cb.answer("Отменено",show_alert=True)
+    if not await guard(cb,session,settings):return
+    d=await state.get_data();await FAQService(session).create(cb.from_user.id,d["faq_question"],d["faq_answer"],d.get("faq_question_kk"),d.get("faq_answer_kk"));await finish_wizard(state,"faq_question","faq_answer","faq_question_kk","faq_answer_kk");await listing(cb,session)
+
+@router.callback_query(FAQCallback.filter(F.action.in_({"create_back_q","create_back_a","create_kk_choice","create_skip_kk","create_edit_ru"})))
+async def create_navigation(cb:CallbackQuery,callback_data:FAQCallback,state:FSMContext):
+    if callback_data.action in {"create_back_q","create_edit_ru"}:
+        await state.set_state(AddFAQ.question);await safe_edit_text(cb.message,"➕ <b>Новый FAQ</b>\n\nШаг 1 из 4\n🇷🇺 <b>Вопрос</b>\n\nОтправьте вопрос на русском языке.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]))
+    elif callback_data.action=="create_back_a":
+        await state.set_state(AddFAQ.answer);d=await state.get_data();await safe_edit_text(cb.message,f"➕ <b>Новый FAQ</b>\n\nШаг 2 из 4\n🇷🇺 <b>Ответ</b>\n\n❓ Вопрос:\n{html_text(text_preview(d['faq_question'],120))}\n\nОтправьте ответ на русском языке.",reply_markup=kb([[InlineKeyboardButton(text="⬅️ Назад",callback_data=FAQCallback(action="create_back_q").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]))
+    elif callback_data.action=="create_skip_kk":await state.update_data(faq_question_kk=None,faq_answer_kk=None);await show_create_preview(cb.bot,state)
+    else:await show_kk_choice(cb.bot,state)
+    await cb.answer()
+
+@router.callback_query(FAQCallback.filter(F.action=="create_cancel"))
+async def cancel_create(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext):
+    await finish_wizard(state,"faq_question","faq_answer","faq_question_kk","faq_answer_kk");await listing(cb,session)
 
 @router.callback_query(FAQCallback.filter(F.action.in_({"up","down","toggle","delete_ask","delete_yes"})))
 async def mutate(cb:CallbackQuery,callback_data:FAQCallback,session:AsyncSession,settings:Settings):

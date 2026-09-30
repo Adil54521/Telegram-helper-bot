@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from google import genai
 from google.genai import types
@@ -24,6 +24,7 @@ class AIProviderResponse:
 
 class AIProvider(Protocol):
     async def generate(self, *, instructions: str, user_input: str, max_output_tokens: int = 400) -> AIProviderResponse: ...
+    async def generate_structured(self, *, instructions: str, user_input: str, response_schema: Any, max_output_tokens: int) -> tuple[Any, TokenUsage]: ...
     async def close(self) -> None: ...
 
 
@@ -69,6 +70,33 @@ class GeminiProvider:
                 total_tokens=total_tokens,
             ),
         )
+
+    async def generate_structured(self, *, instructions: str, user_input: str, response_schema: Any, max_output_tokens: int) -> tuple[Any, TokenUsage]:
+        try:
+            response = await self.client.aio.models.generate_content(
+                model=self.model,
+                contents=user_input,
+                config=types.GenerateContentConfig(
+                    system_instruction=instructions,
+                    response_mime_type="application/json",
+                    response_schema=response_schema,
+                    max_output_tokens=max_output_tokens,
+                    temperature=0.1,
+                ),
+            )
+            parsed = response.parsed
+            metadata = response.usage_metadata
+        except Exception as error:
+            raise AIProviderError("AI provider structured request failed") from error
+        if parsed is None:
+            raise AIProviderError("AI provider returned malformed structured output")
+        prompt_tokens = int(getattr(metadata, "prompt_token_count", None) or 0)
+        tool_tokens = int(getattr(metadata, "tool_use_prompt_token_count", None) or 0)
+        candidate_tokens = int(getattr(metadata, "candidates_token_count", None) or 0)
+        thinking_tokens = int(getattr(metadata, "thoughts_token_count", None) or 0)
+        total_tokens = int(getattr(metadata, "total_token_count", None) or 0)
+        usage = TokenUsage(prompt_tokens + tool_tokens, candidate_tokens + thinking_tokens, total_tokens or prompt_tokens + tool_tokens + candidate_tokens + thinking_tokens)
+        return parsed, usage
 
     async def close(self) -> None:
         await self.client.aio.aclose()

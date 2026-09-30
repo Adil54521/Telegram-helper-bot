@@ -11,6 +11,8 @@ class EditPage(StatesGroup):
 class CreatePage(StatesGroup):
     title = State()
     text = State()
+    title_kk = State()
+    text_kk = State()
     confirm = State()
 
 
@@ -38,6 +40,18 @@ class EditFAQ(StatesGroup):
     value = State()
 
 
+class ImportFAQ(StatesGroup):
+    file = State()
+    preview = State()
+    translation_preview = State()
+    translation_edit = State()
+
+
+class TranslatePage(StatesGroup):
+    preview = State()
+    edit = State()
+
+
 class AddAdmin(StatesGroup):
     telegram_id = State()
     role = State()
@@ -52,6 +66,8 @@ class CreateBroadcast(StatesGroup):
 
 class AddAttachment(StatesGroup):
     file = State()
+    caption_ru = State()
+    caption_kk = State()
     confirm = State()
 
 

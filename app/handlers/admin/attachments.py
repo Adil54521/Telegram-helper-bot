@@ -12,6 +12,10 @@ from app.services.pages import PageService
 from app.services.permissions import Permission, PermissionService
 from app.states.admin import AddAttachment, EditAttachment
 from app.utils.telegram import safe_edit_text
+from app.utils.wizard import consume_input, finish_wizard, remember_wizard
+from app.utils.wizard import edit_wizard
+from app.ai.service import AIService
+from app.database.repositories.users import upsert_user
 from app.utils.presentation import html_text, text_preview
 router=Router(name="attachments")
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
@@ -32,24 +36,59 @@ async def list_(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncS
     if await guard(cb,session,settings):await listing(cb,callback_data.page_id,session)
 @router.callback_query(AttachmentCallback.filter(F.action=="add"))
 async def add(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncSession,settings:Settings,state:FSMContext):
-    if await guard(cb,session,settings):await state.set_state(AddAttachment.file);await state.update_data(page_id=callback_data.page_id);await cb.message.answer("Отправьте документ или изображение.");await cb.answer()
+    if await guard(cb,session,settings):await state.set_state(AddAttachment.file);await state.update_data(page_id=callback_data.page_id);await remember_wizard(state,cb.message);await safe_edit_text(cb.message,"📎 <b>Новое вложение</b>\n\nШаг 1 из 2\nОтправьте документ или изображение.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=AttachmentCallback(action="cancel",page_id=callback_data.page_id).pack())]]));await cb.answer()
 @router.message(AddAttachment.file,F.document|F.photo)
 async def receive(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
     if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
     if m.document:type_,file_id,name=MediaType.DOCUMENT,m.document.file_id,m.document.file_name
     else:type_,file_id,name=MediaType.PHOTO,m.photo[-1].file_id,"image.jpg"
-    await state.update_data(type=type_.value,file_id=file_id,file_name=name);await state.set_state(AddAttachment.confirm)
-    if type_==MediaType.PHOTO:await m.answer_photo(file_id,caption=html_text(name))
-    else:await m.answer_document(file_id,caption=html_text(name))
-    await m.answer("Добавить вложение?",reply_markup=kb([[InlineKeyboardButton(text="✅ Добавить",callback_data=AttachmentCallback(action="create").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=AttachmentCallback(action="cancel").pack())]]))
+    await state.update_data(type=type_.value,file_id=file_id,file_name=name,caption_ru=None,caption_kk=None);await consume_input(m);await state.set_state(AddAttachment.caption_ru)
+    await edit_wizard(m.bot,state,f"📎 <b>Новое вложение</b>\n\n{'🖼' if type_==MediaType.PHOTO else '📄'} {html_text(name or 'Файл')}\n\nШаг 2 из 3\n🇷🇺 <b>Подпись</b>",kb([[InlineKeyboardButton(text="✍️ Добавить подпись",callback_data=AttachmentCallback(action="new_cap_ru").pack())],[InlineKeyboardButton(text="⏭ Без подписи",callback_data=AttachmentCallback(action="new_no_cap").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=AttachmentCallback(action="cancel").pack())]]))
 @router.message(AddAttachment.file)
 async def wrong(m:Message):await m.answer("Нужен документ или изображение.")
+
+@router.callback_query(AttachmentCallback.filter(F.action=="new_cap_ru"))
+async def cap_ru(cb:CallbackQuery,state:FSMContext):await state.set_state(AddAttachment.caption_ru);await safe_edit_text(cb.message,"📎 <b>Новое вложение</b>\n\nШаг 2 из 3\n🇷🇺 Отправьте подпись.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=AttachmentCallback(action="cancel").pack())]]));await cb.answer()
+
+@router.message(AddAttachment.caption_ru,F.text)
+async def receive_cap_ru(m:Message,state:FSMContext):
+    value=m.text.strip()
+    if len(value)>1024:return
+    await state.update_data(caption_ru=value);await consume_input(m);await show_kk_caption(m.bot,state)
+
+async def show_kk_caption(bot,state):
+    d=await state.get_data()
+    if not d.get("caption_ru"):return await show_attachment_preview(bot,state)
+    await state.set_state(AddAttachment.caption_kk);await edit_wizard(bot,state,f"📎 <b>Новое вложение</b>\n\nШаг 3 из 3\n🇰🇿 <b>Подпись</b>\n\n🇷🇺 {html_text(text_preview(d['caption_ru'],160))}",kb([[InlineKeyboardButton(text="✍️ Ввести вручную",callback_data=AttachmentCallback(action="new_cap_kk").pack())],[InlineKeyboardButton(text="✨ Перевести RU → KK",callback_data=AttachmentCallback(action="new_cap_ai").pack())],[InlineKeyboardButton(text="⏭ Без KK",callback_data=AttachmentCallback(action="new_cap_preview").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=AttachmentCallback(action="cancel").pack())]]))
+
+@router.callback_query(AttachmentCallback.filter(F.action=="new_no_cap"))
+async def no_cap(cb:CallbackQuery,state:FSMContext):await state.update_data(caption_ru=None,caption_kk=None);await show_attachment_preview(cb.bot,state);await cb.answer()
+@router.callback_query(AttachmentCallback.filter(F.action=="new_cap_kk"))
+async def cap_kk(cb:CallbackQuery,state:FSMContext):await state.set_state(AddAttachment.caption_kk);await safe_edit_text(cb.message,"📎 <b>Новое вложение</b>\n\nШаг 3 из 3\n🇰🇿 Отправьте подпись.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=AttachmentCallback(action="cancel").pack())]]));await cb.answer()
+@router.message(AddAttachment.caption_kk,F.text)
+async def receive_cap_kk(m:Message,state:FSMContext):
+    if len(m.text.strip())>1024:return
+    await state.update_data(caption_kk=m.text.strip());await consume_input(m);await show_attachment_preview(m.bot,state)
+@router.callback_query(AttachmentCallback.filter(F.action=="new_cap_preview"))
+async def no_kk_cap(cb:CallbackQuery,state:FSMContext):await state.update_data(caption_kk=None);await show_attachment_preview(cb.bot,state);await cb.answer()
+@router.callback_query(AttachmentCallback.filter(F.action=="new_cap_ai"))
+async def ai_cap(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext,ai_service:AIService|None):
+    if not settings.ai_available or ai_service is None:return await cb.answer("Gemini недоступен",show_alert=True)
+    d=await state.get_data();user=await upsert_user(session,cb.from_user)
+    try:value=await ai_service.translate_short_text(session,user_id=user.id,text=d["caption_ru"],request_type="CMS_TRANSLATION",max_length=1024)
+    except Exception:return await cb.answer("Не удалось создать перевод",show_alert=True)
+    await state.update_data(caption_kk=value);await show_attachment_preview(cb.bot,state);await cb.answer()
+
+async def show_attachment_preview(bot,state):
+    d=await state.get_data();await state.set_state(AddAttachment.confirm)
+    await edit_wizard(bot,state,f"👁 <b>Предпросмотр вложения</b>\n\n{'🖼' if d['type']==MediaType.PHOTO.value else '📄'} {html_text(d.get('file_name') or 'Файл')}\n\n🇷🇺 Подпись:\n{html_text(d.get('caption_ru') or '—')}\n\n🇰🇿 Қолтаңба:\n{html_text(d.get('caption_kk') or '—')}",kb([[InlineKeyboardButton(text="✅ Добавить вложение",callback_data=AttachmentCallback(action="create").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=AttachmentCallback(action="cancel",page_id=d["page_id"]).pack())]]))
 @router.callback_query(AddAttachment.confirm,AttachmentCallback.filter(F.action=="create"))
 async def create(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext):
     if not await guard(cb,session,settings):await state.clear();return
-    d=await state.get_data();await AttachmentService(session).create(d["page_id"],cb.from_user.id,MediaType(d["type"]),d["file_id"],d.get("file_name"));await state.clear();await listing(cb,d["page_id"],session)
+    d=await state.get_data();await AttachmentService(session).create(d["page_id"],cb.from_user.id,MediaType(d["type"]),d["file_id"],d.get("file_name"),d.get("caption_ru"),d.get("caption_kk"));await finish_wizard(state,"page_id","type","file_id","file_name","caption_ru","caption_kk");await listing(cb,d["page_id"],session)
 @router.callback_query(AttachmentCallback.filter(F.action=="cancel"))
-async def cancel(cb:CallbackQuery,state:FSMContext):await state.clear();await cb.answer("Отменено",show_alert=True)
+async def cancel(cb:CallbackQuery,callback_data:AttachmentCallback,state:FSMContext,session:AsyncSession):
+    d=await state.get_data();page_id=callback_data.page_id or d.get("page_id");await finish_wizard(state,"page_id","type","file_id","file_name");await listing(cb,page_id,session)
 @router.callback_query(AttachmentCallback.filter(F.action=="open"))
 async def open_(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncSession,settings:Settings):
     if not await guard(cb,session,settings):return

@@ -2,6 +2,9 @@ import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Sequence
+
+from pydantic import BaseModel, Field
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +26,21 @@ class AIRateLimitError(RuntimeError):
 class AIAnswer:
     text: str
     result_count: int
+
+
+class FAQTranslation(BaseModel):
+    index: int = Field(ge=0)
+    question_kk: str = Field(min_length=1, max_length=500)
+    answer_kk: str = Field(min_length=1, max_length=10_000)
+
+
+class PageTranslation(BaseModel):
+    title_kk: str = Field(min_length=1, max_length=255)
+    text_kk: str = Field(min_length=1, max_length=20_000)
+
+
+class ShortTranslation(BaseModel):
+    text_kk: str = Field(min_length=1, max_length=1024)
 
 
 def _zero_cost() -> AICost:
@@ -159,3 +177,51 @@ class AIService:
         await self._record(session, user_id=user_id, request_type="USER", language=language, retrieval_count=len(items), gemini_called=True, input_tokens=usage.input_tokens, output_tokens=usage.output_tokens, total_tokens=usage.total_tokens, cost=cost, duration_ms=duration_ms, success=True)
         logger.info("AI request user_id=%s language=%s provider=%s model=%s retrieval=%s gemini_called=true input_tokens=%d output_tokens=%d total_tokens=%d estimated_cost_usd=%s duration_ms=%d success=true", user_id, language, self.provider_name, self.model, len(items), usage.input_tokens, usage.output_tokens, usage.total_tokens, cost.total_cost, duration_ms)
         return AIAnswer(text=response.text, result_count=len(items))
+
+    async def _structured_translation(self, session: AsyncSession, *, user_id: int, request_type: str, user_input: str, schema: object, max_output_tokens: int) -> object:
+        started = time.monotonic()
+        try:
+            parsed, usage = await self.provider.generate_structured(
+                instructions="Translate only the supplied Russian university content into natural, accurate Kazakh. Preserve meaning, formatting, names, URLs and numbers. Return only the required structured result.",
+                user_input=user_input,
+                response_schema=schema,
+                max_output_tokens=max_output_tokens,
+            )
+        except Exception as error:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            await self._record(session, user_id=user_id, request_type=request_type, language="kk", retrieval_count=0, gemini_called=True, input_tokens=0, output_tokens=0, total_tokens=0, cost=_zero_cost(), duration_ms=duration_ms, success=False, error_type=type(error).__name__)
+            raise
+        duration_ms = int((time.monotonic() - started) * 1000)
+        cost = calculate_cost(usage.input_tokens, usage.output_tokens, self.input_price_per_1m, self.output_price_per_1m)
+        await self._record(session, user_id=user_id, request_type=request_type, language="kk", retrieval_count=0, gemini_called=True, input_tokens=usage.input_tokens, output_tokens=usage.output_tokens, total_tokens=usage.total_tokens, cost=cost, duration_ms=duration_ms, success=True)
+        logger.info("AI translation user_id=%s type=%s provider=%s model=%s input_tokens=%d output_tokens=%d total_tokens=%d estimated_cost_usd=%s duration_ms=%d success=true", user_id, request_type, self.provider_name, self.model, usage.input_tokens, usage.output_tokens, usage.total_tokens, cost.total_cost, duration_ms)
+        return parsed
+
+    async def translate_faq_batch(self, session: AsyncSession, *, user_id: int, rows: Sequence[dict[str, object]]) -> list[FAQTranslation]:
+        if not 1 <= len(rows) <= 10:
+            raise ValueError("FAQ translation batch must contain 1-10 rows")
+        payload = [{"index": index, "question_ru": str(row["question_ru"]), "answer_ru": str(row["answer_ru"])} for index, row in enumerate(rows)]
+        input_text = __import__("json").dumps(payload, ensure_ascii=False)
+        if len(input_text) > 12_000:
+            raise ValueError("FAQ translation batch is too large")
+        limit = min(4096, max(512, len(input_text) // 2 + 256))
+        result = await self._structured_translation(session, user_id=user_id, request_type="FAQ_TRANSLATION", user_input=input_text, schema=list[FAQTranslation], max_output_tokens=limit)
+        values = [value if isinstance(value, FAQTranslation) else FAQTranslation.model_validate(value) for value in result]  # type: ignore[arg-type]
+        if len(values) != len(rows) or {value.index for value in values} != set(range(len(rows))):
+            raise ValueError("Gemini returned an incomplete FAQ translation batch")
+        return sorted(values, key=lambda value: value.index)
+
+    async def translate_page(self, session: AsyncSession, *, user_id: int, title: str, text: str) -> PageTranslation:
+        payload = __import__("json").dumps({"title_ru": title, "text_ru": text}, ensure_ascii=False)
+        if len(payload) > 12_000:
+            raise ValueError("Page is too large for AI translation")
+        limit = min(4096, max(512, len(payload) // 2 + 256))
+        result = await self._structured_translation(session, user_id=user_id, request_type="PAGE_TRANSLATION", user_input=payload, schema=PageTranslation, max_output_tokens=limit)
+        return result if isinstance(result, PageTranslation) else PageTranslation.model_validate(result)
+
+    async def translate_short_text(self, session: AsyncSession, *, user_id: int, text: str, request_type: str = "CMS_TRANSLATION", max_length: int = 1024) -> str:
+        if not text.strip() or len(text) > max_length:
+            raise ValueError("Text is outside translation limits")
+        result = await self._structured_translation(session, user_id=user_id, request_type=request_type, user_input=text, schema=ShortTranslation, max_output_tokens=min(256, max(32, len(text) * 2)))
+        value = result if isinstance(result, ShortTranslation) else ShortTranslation.model_validate(result)
+        return value.text_kk.strip()

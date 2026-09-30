@@ -10,7 +10,10 @@ from app.database.models.enums import LanguageCode
 from app.keyboards.admin import confirm_edit, page_actions, pages_list
 from app.services.pages import PageService
 from app.services.permissions import Permission, PermissionService
-from app.states.admin import CreatePage, EditPage
+from app.states.admin import CreatePage, EditPage, TranslatePage
+from app.ai.service import AIService
+from app.database.repositories.users import upsert_user
+from app.utils.wizard import consume_input, finish_wizard, remember_wizard, edit_wizard
 from app.utils.telegram import safe_edit_text
 from app.utils.i18n import translated
 from app.utils.presentation import html_text, text_preview
@@ -26,11 +29,17 @@ async def deny(callback: CallbackQuery) -> None:
     await callback.answer("Доступ запрещён", show_alert=True)
 
 
-def create_confirm_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def create_confirm_keyboard(ai_available: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        *([[InlineKeyboardButton(text="✨ Создать KK через Gemini", callback_data=AdminPageCallback(action="create_ai_kk", page_id=0).pack())]] if ai_available else []),
         [InlineKeyboardButton(text="✅ Создать", callback_data=AdminPageCallback(action="create_save", page_id=0).pack())],
         [InlineKeyboardButton(text="❌ Отмена", callback_data=AdminPageCallback(action="create_cancel", page_id=0).pack())],
-    ])
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def create_translated_keyboard(ai_available:bool)->InlineKeyboardMarkup:
+    rows=[[InlineKeyboardButton(text="✏️ Название KK",callback_data=AdminPageCallback(action="create_edit_title_kk",page_id=0).pack()),InlineKeyboardButton(text="✏️ Текст KK",callback_data=AdminPageCallback(action="create_edit_text_kk",page_id=0).pack())]]
+    rows.extend(create_confirm_keyboard(ai_available).inline_keyboard);return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def translation_by_language(revision, language: LanguageCode):
     return next(
@@ -195,6 +204,9 @@ async def open_page(callback: CallbackQuery, callback_data: AdminPageCallback, s
         ],
     ]
 
+    if not kk:
+        rows.insert(1, [InlineKeyboardButton(text="✨ Создать перевод KK", callback_data=AdminPageCallback(action="ai_translate", page_id=page.id).pack())])
+
     if (
         not page.published_revision_id
         or page.draft_revision_id
@@ -259,7 +271,8 @@ async def begin_create(callback: CallbackQuery, session: AsyncSession, settings:
         return await deny(callback)
     await state.set_state(CreatePage.title)
     if callback.message:
-        await callback.message.answer("Введите название новой страницы:")
+        await remember_wizard(state, callback.message)
+        await safe_edit_text(callback.message,"📄 <b>Новая страница</b>\n\nШаг 1 из 3\n🇷🇺 <b>Название</b>\n\nОтправьте название страницы.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена",callback_data=AdminPageCallback(action="create_cancel",page_id=0).pack())]]))
     await callback.answer()
 
 
@@ -290,8 +303,9 @@ async def receive_create_title(message: Message, session: AsyncSession, settings
     if not title or len(title) > 255:
         return await message.answer("Название должно содержать от 1 до 255 символов.")
     await state.update_data(title=title)
+    await consume_input(message)
     await state.set_state(CreatePage.text)
-    await message.answer("Введите текст страницы:")
+    await edit_wizard(message.bot,state,f"📄 <b>Новая страница</b>\n\nШаг 2 из 3\n🇷🇺 <b>Текст</b>\n\nНазвание: {html_text(title)}\n\nОтправьте текст страницы.",InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад",callback_data=AdminPageCallback(action="create_back",page_id=0).pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=AdminPageCallback(action="create_cancel",page_id=0).pack())]]))
 
 
 @router.message(CreatePage.text)
@@ -303,14 +317,37 @@ async def receive_create_text(message: Message, session: AsyncSession, settings:
     if not text:
         return await message.answer("Отправьте текстовое сообщение.")
     data = await state.get_data()
+    await consume_input(message)
     key = await PageService(session).unique_key(data["title"])
     await state.update_data(text=text, preview_key=key)
     await state.set_state(CreatePage.confirm)
-    await message.answer(
+    await edit_wizard(message.bot,state,
         f"<b>Предпросмотр новой страницы</b>\n\n<b>{html_text(data['title'])}</b>\n\n{html_text(text)}\n\n"
         f"Системный key: <code>{html_text(key)}</code>\nСтатус: 🟡 Черновик",
-        reply_markup=create_confirm_keyboard(),
+        create_confirm_keyboard(settings.ai_available),
     )
+
+
+@router.callback_query(CreatePage.confirm, AdminPageCallback.filter(F.action == "create_ai_kk"))
+async def create_page_ai_kk(callback:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext,ai_service:AIService|None):
+    if not settings.ai_available or ai_service is None:return await callback.answer("Gemini недоступен",show_alert=True)
+    data=await state.get_data();user=await upsert_user(session,callback.from_user)
+    try:value=await ai_service.translate_page(session,user_id=user.id,title=data["title"],text=data["text"])
+    except Exception:return await callback.answer("Не удалось создать перевод",show_alert=True)
+    await state.update_data(title_kk=value.title_kk,text_kk=value.text_kk)
+    await safe_edit_text(callback.message,f"👁 <b>Предпросмотр страницы</b>\n\n🇷🇺 <b>{html_text(data['title'])}</b>\n{html_text(text_preview(data['text']))}\n\n🇰🇿 <b>{html_text(value.title_kk)}</b>\n{html_text(text_preview(value.text_kk))}\n\n⚠️ Страница ещё не создана и не опубликована.",reply_markup=create_translated_keyboard(settings.ai_available));await callback.answer()
+
+@router.callback_query(CreatePage.confirm,AdminPageCallback.filter(F.action.in_({"create_edit_title_kk","create_edit_text_kk"})))
+async def create_edit_kk(callback:CallbackQuery,callback_data:AdminPageCallback,state:FSMContext):
+    await state.set_state(CreatePage.title_kk if callback_data.action.endswith("title_kk") else CreatePage.text_kk);await safe_edit_text(callback.message,"📄 <b>Новая страница</b>\n\n🇰🇿 Отправьте исправленный KK-перевод.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена",callback_data=AdminPageCallback(action="create_cancel",page_id=0).pack())]]));await callback.answer()
+
+@router.message(CreatePage.title_kk)
+@router.message(CreatePage.text_kk)
+async def receive_create_kk(message:Message,state:FSMContext,settings:Settings):
+    value=(message.text or "").strip();current=await state.get_state()
+    if not value or (current==CreatePage.title_kk.state and len(value)>255):return
+    await state.update_data(**({"title_kk":value} if current==CreatePage.title_kk.state else {"text_kk":value}));await consume_input(message);d=await state.get_data();await state.set_state(CreatePage.confirm)
+    await edit_wizard(message.bot,state,f"👁 <b>Предпросмотр страницы</b>\n\n🇷🇺 <b>{html_text(d['title'])}</b>\n{html_text(text_preview(d['text']))}\n\n🇰🇿 <b>{html_text(d['title_kk'])}</b>\n{html_text(text_preview(d['text_kk']))}\n\n⚠️ Страница ещё не создана и не опубликована.",create_translated_keyboard(settings.ai_available))
 
 
 @router.callback_query(CreatePage.confirm, AdminPageCallback.filter(F.action == "create_save"))
@@ -323,17 +360,26 @@ async def save_created_page(callback: CallbackQuery, session: AsyncSession, sett
         await state.clear()
         return await callback.answer("Сессия создания истекла", show_alert=True)
     page = await PageService(session).create(data["title"], data["text"], callback.from_user.id)
-    await state.clear()
+    if data.get("title_kk") and data.get("text_kk"):
+        await PageService(session).update_translation(page.id,callback.from_user.id,LanguageCode.KK,title=data["title_kk"],text=data["text_kk"])
+    await finish_wizard(state,"title","text","preview_key")
     await callback.answer("Страница создана как черновик", show_alert=True)
     await open_page(callback, AdminPageCallback(action="open", page_id=page.id), session, settings)
 
 
 @router.callback_query(AdminPageCallback.filter(F.action == "create_cancel"))
 async def cancel_create(callback: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
-    await state.clear()
+    await finish_wizard(state,"title","text","preview_key")
     if not await authorized(callback.from_user.id, session, settings):
         return await deny(callback)
     await list_pages(callback, session, settings)
+
+
+@router.callback_query(AdminPageCallback.filter(F.action == "create_back"))
+async def back_create(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(CreatePage.title)
+    await safe_edit_text(callback.message,"📄 <b>Новая страница</b>\n\nШаг 1 из 3\n🇷🇺 <b>Название</b>\n\nОтправьте название страницы.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена",callback_data=AdminPageCallback(action="create_cancel",page_id=0).pack())]]))
+    await callback.answer()
 
 
 @router.callback_query(AdminPageCallback.filter(F.action.in_({"text", "title", "text_ru", "title_ru", "text_kk", "title_kk"})))
@@ -389,6 +435,66 @@ async def cancel_edit(callback: CallbackQuery, callback_data: AdminPageCallback,
     if not await authorized(callback.from_user.id, session, settings):
         return await deny(callback)
     await open_page(callback, AdminPageCallback(action="open", page_id=callback_data.page_id), session, settings)
+
+
+def ai_page_preview_keyboard(page_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить название", callback_data=AdminPageCallback(action="ai_edit_title", page_id=page_id).pack())],
+        [InlineKeyboardButton(text="✏️ Изменить текст", callback_data=AdminPageCallback(action="ai_edit_text", page_id=page_id).pack())],
+        [InlineKeyboardButton(text="✅ Сохранить KK в черновик", callback_data=AdminPageCallback(action="ai_save", page_id=page_id).pack())],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=AdminPageCallback(action="ai_cancel", page_id=page_id).pack())],
+    ])
+
+
+@router.callback_query(AdminPageCallback.filter(F.action == "ai_translate"))
+async def ai_translate_page(callback: CallbackQuery, callback_data: AdminPageCallback, session: AsyncSession, settings: Settings, state: FSMContext, ai_service: AIService | None) -> None:
+    if not await authorized(callback.from_user.id, session, settings): return await deny(callback)
+    if not settings.ai_available or ai_service is None: return await callback.answer("Gemini недоступен", show_alert=True)
+    page = await PageRepository(session).by_id(callback_data.page_id)
+    if not page or not page.draft_revision: return await callback.answer("Страница не найдена", show_alert=True)
+    ru = translation_by_language(page.draft_revision, LanguageCode.RU)
+    title, text = (ru.title, ru.text) if ru else (page.draft_revision.title, page.draft_revision.text)
+    user = await upsert_user(session, callback.from_user)
+    try:
+        result = await ai_service.translate_page(session, user_id=user.id, title=title, text=text)
+    except Exception:
+        return await callback.answer("Gemini не смог подготовить корректный перевод", show_alert=True)
+    await state.update_data(ai_page_id=page.id, ai_page_title_kk=result.title_kk.strip(), ai_page_text_kk=result.text_kk.strip())
+    await state.set_state(TranslatePage.preview)
+    await safe_edit_text(callback.message, f"✨ <b>Предложенный перевод страницы</b>\n\n🇷🇺 <b>Название:</b> {html_text(title)}\n🇰🇿 <b>Название:</b> {html_text(result.title_kk)}\n\n🇷🇺 <b>Текст:</b>\n{html_text(text_preview(text))}\n\n🇰🇿 <b>Текст:</b>\n{html_text(text_preview(result.text_kk))}\n\n⚠️ Перевод ещё не сохранён и не опубликован.", reply_markup=ai_page_preview_keyboard(page.id))
+    await callback.answer()
+
+
+@router.callback_query(TranslatePage.preview, AdminPageCallback.filter(F.action.in_({"ai_edit_title", "ai_edit_text"})))
+async def begin_ai_page_edit(callback: CallbackQuery, callback_data: AdminPageCallback, state: FSMContext) -> None:
+    await state.update_data(ai_page_field="title" if callback_data.action.endswith("title") else "text")
+    await state.set_state(TranslatePage.edit)
+    await callback.message.answer("Введите исправленный KK-перевод:"); await callback.answer()
+
+
+@router.message(TranslatePage.edit, F.text)
+async def receive_ai_page_edit(message: Message, state: FSMContext) -> None:
+    data = await state.get_data(); field = data.get("ai_page_field")
+    value = message.text.strip()
+    if field == "title" and len(value) > 255: return await message.answer("Название должно быть не длиннее 255 символов.")
+    await state.update_data(**{f"ai_page_{field}_kk": value})
+    await state.set_state(TranslatePage.preview)
+    await message.answer("✅ Изменение сохранено в предпросмотре. Используйте кнопку «Сохранить KK в черновик».", reply_markup=ai_page_preview_keyboard(data["ai_page_id"]))
+
+
+@router.callback_query(TranslatePage.preview, AdminPageCallback.filter(F.action == "ai_save"))
+async def save_ai_page(callback: CallbackQuery, callback_data: AdminPageCallback, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
+    if not await authorized(callback.from_user.id, session, settings): await state.clear(); return await deny(callback)
+    data = await state.get_data()
+    if data.get("ai_page_id") != callback_data.page_id: await state.clear(); return await callback.answer("Сессия перевода истекла", show_alert=True)
+    await PageService(session).update_translation(callback_data.page_id, callback.from_user.id, LanguageCode.KK, title=data["ai_page_title_kk"], text=data["ai_page_text_kk"])
+    await state.clear(); await callback.answer("KK-перевод сохранён только в черновик", show_alert=True)
+    await open_page(callback, AdminPageCallback(action="open", page_id=callback_data.page_id), session, settings)
+
+
+@router.callback_query(AdminPageCallback.filter(F.action == "ai_cancel"))
+async def cancel_ai_page(callback: CallbackQuery, callback_data: AdminPageCallback, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
+    await state.clear(); await open_page(callback, AdminPageCallback(action="open", page_id=callback_data.page_id), session, settings)
 
 
 @router.callback_query(AdminPageCallback.filter(F.action == "preview"))

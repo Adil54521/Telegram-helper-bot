@@ -56,8 +56,8 @@ class ButtonService:
 
 class FAQService:
     def __init__(self, session: AsyncSession) -> None: self.session, self.repo = session, CMSRepository(session)
-    async def create(self, actor: int, question: str, answer: str, question_kk: str | None = None, answer_kk: str | None = None) -> FAQItem:
-        item = FAQItem(question=question, answer=answer, position=len(await self.repo.faqs()))
+    async def create(self, actor: int, question: str, answer: str, question_kk: str | None = None, answer_kk: str | None = None, *, is_active: bool = True) -> FAQItem:
+        item = FAQItem(question=question, answer=answer, position=len(await self.repo.faqs()), is_active=is_active)
         self.session.add(item); await self.session.flush(); self.session.add(FAQItemTranslation(faq_id=item.id,language_code=LanguageCode.RU,question=question,answer=answer))
         if question_kk and answer_kk:self.session.add(FAQItemTranslation(faq_id=item.id,language_code=LanguageCode.KK,question=question_kk,answer=answer_kk))
         audit(self.session, actor, "FAQ_CREATED", "FAQItem", item.id, new={"question": question}); return item

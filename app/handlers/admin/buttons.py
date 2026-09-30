@@ -19,6 +19,9 @@ from app.services.cms import ButtonService
 from app.services.permissions import Permission, PermissionService
 from app.states.admin import AddButton, EditButton
 from app.utils.telegram import safe_edit_text
+from app.utils.wizard import consume_input, edit_wizard, finish_wizard, remember_wizard
+from app.ai.service import AIService
+from app.database.repositories.users import upsert_user
 from app.utils.presentation import button_action_details, button_action_icon, html_text, text_preview
 
 
@@ -480,14 +483,11 @@ async def add(
         return
 
     await state.set_state(AddButton.text)
-    await state.update_data(
-        page_id=callback_data.page_id
-    )
+    await state.update_data(page_id=callback_data.page_id,text=None,text_kk=None,action=None,target=None)
 
     if cb.message:
-        await cb.message.answer(
-            "Введите текст кнопки 🇷🇺:"
-        )
+        await remember_wizard(state,cb.message)
+        await safe_edit_text(cb.message,"🔘 <b>Новая кнопка</b>\n\nШаг 1 из 4\n🇷🇺 <b>Текст кнопки</b>\n\nОтправьте название.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=ButtonCallback(action="new_cancel",page_id=callback_data.page_id).pack())]]))
 
     await cb.answer()
 
@@ -525,12 +525,8 @@ async def add_text(
             "Введите название ещё раз."
         )
 
-    await state.update_data(text=text)
-    await state.set_state(AddButton.text_kk)
-
-    await message.answer(
-        "Введите текст кнопки 🇰🇿:"
-    )
+    await state.update_data(text=text);await consume_input(message);await state.set_state(AddButton.text_kk)
+    await edit_wizard(message.bot,state,f"🔘 <b>Новая кнопка</b>\n\nШаг 2 из 4\n🇰🇿 <b>Қазақша</b>\n\n🇷🇺 Текст: {html_text(text)}",kk_choice_keyboard())
 
 
 @router.message(AddButton.text_kk)
@@ -566,26 +562,37 @@ async def add_text_kk(
             "Введите название ещё раз."
         )
 
-    await state.update_data(text_kk=text)
+    await state.update_data(text_kk=text);await consume_input(message);await show_new_actions(message.bot,state)
+
+
+def kk_choice_keyboard():
+    return kb([[InlineKeyboardButton(text="✍️ Ввести KK",callback_data=ButtonCallback(action="new_kk_manual").pack())],[InlineKeyboardButton(text="✨ Создать KK через Gemini",callback_data=ButtonCallback(action="new_kk_ai").pack())],[InlineKeyboardButton(text="⏭ Без KK",callback_data=ButtonCallback(action="new_kk_skip").pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=ButtonCallback(action="new_back_text").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=ButtonCallback(action="new_cancel").pack())]])
+
+
+async def show_new_actions(bot,state):
     await state.set_state(AddButton.action)
+    rows=[[InlineKeyboardButton(text=label,callback_data=ButtonCallback(action="new_type",value=value).pack())] for label,value in action_choices()]
+    rows += [[InlineKeyboardButton(text="⬅️ Назад",callback_data=ButtonCallback(action="new_back_kk").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=ButtonCallback(action="new_cancel").pack())]]
+    await edit_wizard(bot,state,"🔘 <b>Новая кнопка</b>\n\nШаг 3 из 4\n🎯 <b>Действие</b>\n\nВыберите действие кнопки.",kb(rows))
 
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=label,
-                callback_data=ButtonCallback(
-                    action="new_type",
-                    value=value,
-                ).pack(),
-            )
-        ]
-        for label, value in action_choices()
-    ]
 
-    await message.answer(
-        "🔘 Выберите действие кнопки:",
-        reply_markup=kb(rows),
-    )
+@router.callback_query(ButtonCallback.filter(F.action.in_({"new_kk_manual","new_kk_skip","new_back_text","new_back_kk"})))
+async def new_navigation(cb:CallbackQuery,callback_data:ButtonCallback,state:FSMContext):
+    if callback_data.action=="new_kk_manual":
+        await state.set_state(AddButton.text_kk);await safe_edit_text(cb.message,"🔘 <b>Новая кнопка</b>\n\nШаг 2 из 4\n🇰🇿 Отправьте текст кнопки.",reply_markup=kk_choice_keyboard())
+    elif callback_data.action=="new_kk_skip":await state.update_data(text_kk=None);await show_new_actions(cb.bot,state)
+    elif callback_data.action=="new_back_text":await state.set_state(AddButton.text);await safe_edit_text(cb.message,"🔘 <b>Новая кнопка</b>\n\nШаг 1 из 4\n🇷🇺 Отправьте название.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=ButtonCallback(action="new_cancel").pack())]]))
+    else:d=await state.get_data();await state.set_state(AddButton.text_kk);await safe_edit_text(cb.message,f"🔘 <b>Новая кнопка</b>\n\nШаг 2 из 4\n🇰🇿 <b>Қазақша</b>\n\n🇷🇺 Текст: {html_text(d['text'])}",reply_markup=kk_choice_keyboard())
+    await cb.answer()
+
+
+@router.callback_query(ButtonCallback.filter(F.action=="new_kk_ai"))
+async def new_kk_ai(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext,ai_service:AIService|None):
+    if not settings.ai_available or ai_service is None:return await cb.answer("Gemini недоступен",show_alert=True)
+    d=await state.get_data();user=await upsert_user(session,cb.from_user)
+    try:value=await ai_service.translate_short_text(session,user_id=user.id,text=d["text"],request_type="CMS_TRANSLATION",max_length=128)
+    except Exception:return await cb.answer("Не удалось создать перевод",show_alert=True)
+    await state.update_data(text_kk=value);await show_new_actions(cb.bot,state);await cb.answer()
 
 
 @router.callback_query(
@@ -610,7 +617,6 @@ async def new_type(
     allowed_actions = {
         "PAGE",
         "URL",
-        "BACK",
         "HOME",
         "PHONE",
         "EMAIL",
@@ -688,9 +694,7 @@ async def new_type(
         }
 
         if cb.message:
-            await cb.message.answer(
-                prompts[action]
-            )
+            await safe_edit_text(cb.message,"🔘 <b>Новая кнопка</b>\n\nШаг 4 из 4\n"+prompts[action],reply_markup=kb([[InlineKeyboardButton(text="⬅️ Назад",callback_data=ButtonCallback(action="new_back_action").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=ButtonCallback(action="new_cancel").pack())]]))
 
     await cb.answer()
 
@@ -764,16 +768,17 @@ async def new_target_value(
     await state.update_data(
         target=target
     )
+    await consume_input(message)
     await state.set_state(
         AddButton.confirm
     )
 
-    await message.answer(
+    await edit_wizard(message.bot,state,
         "<b>Новая кнопка</b>\n\n"
         f"🇷🇺 {html_text(data['text'])}\n"
         f"🇰🇿 {html_text(data.get('text_kk', '—'))}\n"
         f"🎯 {button_action_details(action, target)}",
-        reply_markup=confirm_keyboard(),
+        confirm_keyboard(),
     )
 
 
@@ -835,7 +840,7 @@ async def new_save(
         data.get("text_kk"),
     )
 
-    await state.clear()
+    await finish_wizard(state,"page_id","text","text_kk","action","target")
 
     await show_list(
         cb,
@@ -852,13 +857,15 @@ async def new_save(
 async def new_cancel(
     cb: CallbackQuery,
     state: FSMContext,
+    session: AsyncSession,
 ):
-    await state.clear()
+    data=await state.get_data();page_id=data.get("page_id")
+    await finish_wizard(state,"page_id","text","text_kk","action","target")
+    if page_id:await show_list(cb,page_id,session)
+    else:await cb.answer()
 
-    await cb.answer(
-        "Отменено",
-        show_alert=True,
-    )
+@router.callback_query(ButtonCallback.filter(F.action=="new_back_action"))
+async def new_back_action(cb:CallbackQuery,state:FSMContext):await show_new_actions(cb.bot,state);await cb.answer()
 
 @router.callback_query(
     ButtonCallback.filter(

@@ -10,6 +10,7 @@ from app.services.cms import AdminService
 from app.services.permissions import Permission, PermissionService
 from app.states.admin import AddAdmin
 from app.utils.telegram import safe_edit_text
+from app.utils.wizard import consume_input, finish_wizard, remember_wizard
 router=Router(name="admins")
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
 async def guard(cb,s,c):
@@ -34,7 +35,7 @@ async def open_(cb:CallbackQuery,callback_data:AdminCallback,session:AsyncSessio
     await safe_edit_text(cb.message,f"👤 <b>Администратор</b>\n\nTelegram ID: <code>{x.telegram_id}</code>\nИмя: {x.display_name or '—'}\nРоль: {x.role.value}\nАктивен: {'да' if x.is_active else 'нет'}\nСоздан: {x.created_at:%d.%m.%Y %H:%M}",reply_markup=kb(rows));await cb.answer()
 @router.callback_query(AdminCallback.filter(F.action=="add"))
 async def add(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext):
-    if await guard(cb,session,settings):await state.set_state(AddAdmin.telegram_id);await cb.message.answer("Введите Telegram ID пользователя:");await cb.answer()
+    if await guard(cb,session,settings):await state.set_state(AddAdmin.telegram_id);await remember_wizard(state,cb.message);await safe_edit_text(cb.message,"👤 <b>Новый администратор</b>\n\nШаг 1 из 2\n<b>Telegram ID</b>\n\nОтправьте Telegram ID пользователя.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=AdminCallback(action="cancel").pack())]]));await cb.answer()
 @router.message(AddAdmin.telegram_id)
 async def get_id(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
     if not m.from_user or not await permitted(m.from_user.id,session,settings):await state.clear();return
@@ -42,7 +43,7 @@ async def get_id(m:Message,session:AsyncSession,settings:Settings,state:FSMConte
     except ValueError:return await m.answer("Telegram ID должен быть целым числом.")
     if value<=0:return await m.answer("Telegram ID должен быть положительным.")
     if await CMSRepository(session).admin_by_telegram(value):return await m.answer("Такой администратор уже существует.")
-    await state.update_data(telegram_id=value);await state.set_state(AddAdmin.role);await m.answer("Выберите роль:",reply_markup=roles("new_role"))
+    await state.update_data(telegram_id=value);await consume_input(m);await state.set_state(AddAdmin.role);d=await state.get_data();await m.bot.edit_message_text(f"👤 <b>Новый администратор</b>\n\nTelegram ID: <code>{value}</code>\n\nШаг 2 из 2\nВыберите роль:",chat_id=d["wizard_chat_id"],message_id=d["wizard_message_id"],reply_markup=roles("new_role"))
 @router.callback_query(AddAdmin.role,AdminCallback.filter(F.action=="new_role"))
 async def role_new(cb:CallbackQuery,callback_data:AdminCallback,session:AsyncSession,settings:Settings,state:FSMContext):
     if not await guard(cb,session,settings):await state.clear();return
@@ -53,9 +54,9 @@ async def create(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:F
     d=await state.get_data()
     try:await AdminService(session,settings.super_admin_id).create(cb.from_user.id,d["telegram_id"],AdminRole(d["role"]))
     except ValueError as e:return await cb.answer(str(e),show_alert=True)
-    await state.clear();await listing(cb,session)
+    await finish_wizard(state,"telegram_id","role");await listing(cb,session)
 @router.callback_query(AdminCallback.filter(F.action=="cancel"))
-async def cancel(cb:CallbackQuery,state:FSMContext):await state.clear();await cb.answer("Отменено",show_alert=True)
+async def cancel(cb:CallbackQuery,state:FSMContext,session:AsyncSession):await finish_wizard(state,"telegram_id","role");await listing(cb,session)
 @router.callback_query(AdminCallback.filter(F.action=="role"))
 async def choose_role(cb:CallbackQuery,callback_data:AdminCallback,session:AsyncSession,settings:Settings):
     if await guard(cb,session,settings):await safe_edit_text(cb.message,"Выберите новую роль:",reply_markup=roles("set_role",callback_data.item_id));await cb.answer()
