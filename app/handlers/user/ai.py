@@ -8,12 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.provider import AIProviderError
 from app.ai.service import AIRateLimitError, AIService, MAX_QUESTION_LENGTH
-from app.callbacks import UserAICallback, UserNavigationCallback
+from app.callbacks import UserAICallback
 from app.config import Settings
 from app.database.repositories.users import upsert_user
 from app.states.user import AskAI
 from app.utils.i18n import normalize_language, t
 from app.utils.presentation import html_text
+from app.utils.telegram import safe_delete_message
 
 logger = logging.getLogger(__name__)
 router = Router(name="user_ai")
@@ -36,11 +37,9 @@ async def begin_ai(callback: CallbackQuery, session: AsyncSession, settings: Set
 
 @router.callback_query(UserAICallback.filter(F.action == "cancel"))
 async def cancel_ai(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
-    user = await upsert_user(session, callback.from_user)
-    language = normalize_language(user.content_language_code)
     await state.set_state(None)
     if callback.message:
-        await callback.message.answer(t("main_menu", language), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t("main_menu", language), callback_data=UserNavigationCallback(action="home").pack())]]))
+        await safe_delete_message(callback.message)
     await callback.answer()
 
 
