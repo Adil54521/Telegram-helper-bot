@@ -1,6 +1,6 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.callbacks import LanguageCallback, UserPageCallback
+from app.callbacks import LanguageCallback, UserAICallback, UserNavigationCallback, UserPageCallback
 from app.database.models import BotButton
 from app.database.models.enums import ButtonAction
 from app.utils.i18n import t, translated
@@ -45,11 +45,6 @@ def _button_label(
         else button.text
     )
 
-    # BACK является системной кнопкой,
-    # поэтому его название берём из i18n.
-    if button.action_type == ButtonAction.BACK:
-        return t("back", language)
-
     return label
 
 
@@ -86,15 +81,9 @@ def _build_button(
     # =====================================================
 
     if button.action_type == ButtonAction.BACK:
-        # Пока BACK возвращает на main.
-        #
-        # Настоящую историю навигации
-        # добавим отдельно.
         return InlineKeyboardButton(
             text=label,
-            callback_data=UserPageCallback(
-                key="main",
-            ).pack(),
+            callback_data=UserNavigationCallback(action="back").pack(),
         )
 
     # =====================================================
@@ -104,9 +93,7 @@ def _build_button(
     if button.action_type == ButtonAction.HOME:
         return InlineKeyboardButton(
             text=label,
-            callback_data=UserPageCallback(
-                key="main",
-            ).pack(),
+            callback_data=UserNavigationCallback(action="home").pack(),
         )
 
     # =====================================================
@@ -174,6 +161,8 @@ def _build_button(
 def page_keyboard(
     buttons: list[BotButton],
     language: str = "ru",
+    ai_available: bool = False,
+    page_key: str = "main",
 ) -> InlineKeyboardMarkup:
     """
     Создаёт пользовательскую клавиатуру страницы.
@@ -183,7 +172,7 @@ def page_keyboard(
 
     for button in buttons:
         # Неактивные кнопки пользователю не показываем.
-        if not button.is_active:
+        if not button.is_active or button.action_type == ButtonAction.BACK:
             continue
 
         item = _build_button(
@@ -202,6 +191,9 @@ def page_keyboard(
         for row in sorted(rows)
     ]
 
+    if page_key == "main" and ai_available:
+        result.append([InlineKeyboardButton(text=t("ask_ai", language), callback_data=UserAICallback(action="ask").pack())])
+
     # Системная кнопка смены языка.
     result.append(
         [
@@ -216,5 +208,15 @@ def page_keyboard(
             )
         ]
     )
+
+    if page_key != "main":
+        result.append(
+            [
+                InlineKeyboardButton(
+                    text=t("back", language),
+                    callback_data=UserNavigationCallback(action="back").pack(),
+                )
+            ]
+        )
 
     return InlineKeyboardMarkup(inline_keyboard=result)

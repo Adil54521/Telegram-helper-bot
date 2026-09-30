@@ -15,6 +15,7 @@ def dashboard(role: AdminRole) -> InlineKeyboardMarkup:
         (Permission.BROADCAST, "📢 Рассылка", "broadcasts"),
         (Permission.ADMINS, "👥 Администраторы", "admins"),
         (Permission.STATISTICS, "📊 Статистика", "statistics"),
+        (Permission.STATISTICS, "🤖 ИИ-ассистент", "ai"),
     ]
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data=AdminMenuCallback(section=section).pack())] for permission, label, section in definitions if permission in allowed])
 

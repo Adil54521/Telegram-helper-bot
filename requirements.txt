@@ -4,4 +4,4 @@ asyncpg==0.30.0
 alembic==1.16.5
 pydantic-settings==2.10.1
 greenlet==3.2.4
-
+google-genai==1.61.0

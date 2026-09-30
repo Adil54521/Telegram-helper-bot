@@ -15,14 +15,23 @@ class Settings(BaseSettings):
     postgres_port: int = 5432
     super_admin_id: int = Field(gt=0)
     log_level: str = "INFO"
+    ai_enabled: bool = False
+    ai_provider: str = "gemini"
+    gemini_api_key: SecretStr | None = None
+    gemini_model: str = ""
+    ai_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    ai_cooldown_seconds: float = Field(default=8.0, ge=0, le=300)
 
     @property
     def database_url(self) -> str:
         password = self.postgres_password.get_secret_value()
         return f"postgresql+asyncpg://{self.postgres_user}:{password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
 
+    @property
+    def ai_available(self) -> bool:
+        return bool(self.ai_enabled and self.ai_provider == "gemini" and self.gemini_api_key and self.gemini_api_key.get_secret_value() and self.gemini_model)
+
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]
-

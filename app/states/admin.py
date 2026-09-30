@@ -57,3 +57,7 @@ class AddAttachment(StatesGroup):
 
 class EditAttachment(StatesGroup):
     caption = State()
+
+
+class TestAIRetrieval(StatesGroup):
+    query = State()

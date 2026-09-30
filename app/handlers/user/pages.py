@@ -1,8 +1,10 @@
 from aiogram import Router
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.callbacks import LanguageCallback, UserPageCallback
+from app.callbacks import LanguageCallback, UserNavigationCallback, UserPageCallback
+from app.config import Settings
 from app.database.models import PageView
 from app.database.models.enums import ButtonAction
 from app.database.repositories.cms import CMSRepository
@@ -28,7 +30,8 @@ async def send_page(
     session: AsyncSession,
     key: str,
     language: str | None = None,
-) -> None:
+    ai_available: bool = False,
+) -> bool:
     repo = PageRepository(session)
 
     page = await repo.by_key(key)
@@ -64,6 +67,8 @@ async def send_page(
         markup = page_keyboard(
             [],
             language,
+            ai_available,
+            key,
         )
 
     else:
@@ -93,6 +98,8 @@ async def send_page(
         markup = page_keyboard(
             buttons,
             language,
+            ai_available,
+            key,
         )
 
         if user:
@@ -146,7 +153,7 @@ async def send_page(
         )
 
         if not recipient:
-            return
+            return True
 
         for attachment in attachments:
             caption = attachment_caption(
@@ -166,10 +173,21 @@ async def send_page(
                     caption=caption,
                 )
 
+    return bool(page and page.is_active and page.published_revision)
+
+
+async def navigation_state(state: FSMContext) -> tuple[str, list[str]]:
+    data = await state.get_data()
+    current = str(data.get("current_page") or "main")
+    raw_stack = data.get("navigation_stack") or []
+    stack = [str(item) for item in raw_stack if item]
+    return current, stack
+
 
 async def handle_phone(
     callback: CallbackQuery,
     session: AsyncSession,
+    settings: Settings,
     button_id: int,
     language: str,
 ) -> None:
@@ -269,6 +287,8 @@ async def open_page(
     callback: CallbackQuery,
     callback_data: UserPageCallback,
     session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
 ) -> None:
     logger.debug(
         "UserPageCallback received: user_id=%s key=%r",
@@ -344,12 +364,60 @@ async def open_page(
         )
         return
 
-    await send_page(
+    current, stack = await navigation_state(state)
+    if key == current:
+        next_stack = stack
+    else:
+        next_stack = [*stack, current]
+
+    opened = await send_page(
         callback,
         session,
         key,
         language,
+        settings.ai_available,
     )
+    if opened:
+        await state.update_data(
+            current_page=key,
+            navigation_stack=next_stack,
+        )
+
+
+@router.callback_query(UserNavigationCallback.filter())
+async def navigate(
+    callback: CallbackQuery,
+    callback_data: UserNavigationCallback,
+    session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    user = await upsert_user(session, callback.from_user)
+    language = normalize_language(user.content_language_code)
+    current, stack = await navigation_state(state)
+
+    if callback_data.action == "home":
+        target = "main"
+        next_stack: list[str] = []
+    elif callback_data.action == "back":
+        target = stack[-1] if stack else "main"
+        next_stack = stack[:-1] if stack else []
+    else:
+        await callback.answer(t("unavailable", language), show_alert=True)
+        return
+
+    opened = await send_page(
+        callback,
+        session,
+        target,
+        language,
+        settings.ai_available,
+    )
+    if opened:
+        await state.update_data(
+            current_page=target,
+            navigation_stack=next_stack,
+        )
 
 
 @router.callback_query(
@@ -359,6 +427,8 @@ async def select_language(
     callback: CallbackQuery,
     callback_data: LanguageCallback,
     session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
 ) -> None:
     if callback_data.code not in {
         "ru",
@@ -379,9 +449,13 @@ async def select_language(
         callback_data.code
     )
 
-    await send_page(
+    current, _ = await navigation_state(state)
+    opened = await send_page(
         callback,
         session,
-        "main",
+        current,
         callback_data.code,
+        settings.ai_available,
     )
+    if not opened and current != "main":
+        await state.update_data(current_page="main", navigation_stack=[])

@@ -9,6 +9,18 @@ class LanguageCallback(CallbackData, prefix="lang"):
     code: str
 
 
+class UserAICallback(CallbackData, prefix="uai"):
+    action: str
+
+
+class UserNavigationCallback(CallbackData, prefix="unav"):
+    action: str
+
+
+class AdminAICallback(CallbackData, prefix="aai"):
+    action: str
+
+
 class AdminPageCallback(CallbackData, prefix="ap"):
     action: str
     page_id: int

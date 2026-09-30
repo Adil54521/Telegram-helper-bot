@@ -13,6 +13,9 @@ from app.handlers.admin import router as admin_router
 from app.handlers.user import router as user_router
 from app.middlewares.database import DatabaseMiddleware
 from app.services.seed import seed
+from app.ai.knowledge import KnowledgeService
+from app.ai.provider import GeminiProvider
+from app.ai.service import AIService
 
 
 async def main() -> None:
@@ -25,6 +28,20 @@ async def main() -> None:
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher["settings"] = settings
     dispatcher["session_factory"] = session_factory
+    ai_service = None
+    if settings.ai_available and settings.gemini_api_key:
+        provider = GeminiProvider(settings.gemini_api_key.get_secret_value(), settings.gemini_model, settings.ai_timeout_seconds)
+        ai_service = AIService(
+            provider,
+            settings.ai_cooldown_seconds,
+            KnowledgeService(),
+            provider_name=settings.ai_provider,
+            model=settings.gemini_model,
+        )
+        logger.info("AI assistant enabled provider=%s model=%s", settings.ai_provider, settings.gemini_model)
+    elif settings.ai_enabled:
+        logger.warning("AI assistant requested but configuration is incomplete; AI remains unavailable")
+    dispatcher["ai_service"] = ai_service
     database = DatabaseMiddleware(session_factory)
     dispatcher.update.outer_middleware(database)
     dispatcher.include_routers(admin_router(), user_router())
@@ -42,6 +59,8 @@ async def main() -> None:
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
+        if ai_service:
+            await ai_service.close()
         await bot.session.close()
         await engine.dispose()  # type: ignore[union-attr]
 
