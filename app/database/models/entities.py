@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from decimal import Decimal
+
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -151,6 +153,34 @@ class PageView(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.id", ondelete="CASCADE"), index=True)
     page_id: Mapped[int] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class AIUsage(Base):
+    __tablename__ = "ai_usage"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.id", ondelete="CASCADE"), index=True)
+    request_type: Mapped[str] = mapped_column(String(32), index=True)
+    language: Mapped[str] = mapped_column(String(8))
+    provider: Mapped[str] = mapped_column(String(32))
+    model: Mapped[str] = mapped_column(String(128))
+    retrieval_count: Mapped[int] = mapped_column(Integer, default=0)
+    gemini_called: Mapped[bool] = mapped_column(Boolean, default=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    input_price_per_1m: Mapped[Decimal] = mapped_column(Numeric(18, 10), default=Decimal("0"))
+    output_price_per_1m: Mapped[Decimal] = mapped_column(Numeric(18, 10), default=Decimal("0"))
+    input_cost_usd: Mapped[Decimal] = mapped_column(Numeric(18, 10), default=Decimal("0"))
+    output_cost_usd: Mapped[Decimal] = mapped_column(Numeric(18, 10), default=Decimal("0"))
+    total_cost_usd: Mapped[Decimal] = mapped_column(Numeric(18, 10), default=Decimal("0"))
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    error_type: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    __table_args__ = (
+        Index("ix_ai_usage_type_created", "request_type", "created_at"),
+    )
 
 
 class Broadcast(Base):

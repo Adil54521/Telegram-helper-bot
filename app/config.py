@@ -1,4 +1,5 @@
 from functools import lru_cache
+from decimal import Decimal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,12 +16,17 @@ class Settings(BaseSettings):
     postgres_port: int = 5432
     super_admin_id: int = Field(gt=0)
     log_level: str = "INFO"
+    log_dir: str = "logs"
+    log_max_bytes: int = Field(default=20_971_520, gt=0)
+    log_backup_count: int = Field(default=10, ge=1, le=100)
     ai_enabled: bool = False
     ai_provider: str = "gemini"
     gemini_api_key: SecretStr | None = None
     gemini_model: str = ""
     ai_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     ai_cooldown_seconds: float = Field(default=8.0, ge=0, le=300)
+    gemini_input_price_per_1m: Decimal = Field(default=Decimal("0.30"), ge=0)
+    gemini_output_price_per_1m: Decimal = Field(default=Decimal("2.50"), ge=0)
 
     @property
     def database_url(self) -> str:

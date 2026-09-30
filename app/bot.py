@@ -16,14 +16,18 @@ from app.services.seed import seed
 from app.ai.knowledge import KnowledgeService
 from app.ai.provider import GeminiProvider
 from app.ai.service import AIService
+from app.utils.logging import configure_logging
 
 
 async def main() -> None:
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    log_dir = configure_logging(settings)
     logger = logging.getLogger(__name__)
+    logger.info("Logging initialized dir=%s", log_dir)
+    logger.info("Bot starting")
     engine, session_factory = create_session_factory(settings)
     await seed(session_factory)
+    logger.info("Database initialized")
     bot = Bot(settings.bot_token.get_secret_value(), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher["settings"] = settings
@@ -37,6 +41,8 @@ async def main() -> None:
             KnowledgeService(),
             provider_name=settings.ai_provider,
             model=settings.gemini_model,
+            input_price_per_1m=settings.gemini_input_price_per_1m,
+            output_price_per_1m=settings.gemini_output_price_per_1m,
         )
         logger.info("AI assistant enabled provider=%s model=%s", settings.ai_provider, settings.gemini_model)
     elif settings.ai_enabled:
