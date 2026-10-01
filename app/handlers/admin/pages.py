@@ -17,6 +17,7 @@ from app.utils.wizard import consume_input, finish_wizard, remember_wizard, edit
 from app.utils.telegram import safe_edit_text
 from app.utils.i18n import translated
 from app.utils.presentation import html_text, text_preview
+from app.utils.pagination import paginate
 
 router = Router(name="admin_pages")
 
@@ -53,18 +54,21 @@ def translation_by_language(revision, language: LanguageCode):
 
 
 @router.callback_query(AdminMenuCallback.filter(F.section.in_({"pages", "buttons"})))
-async def list_pages(callback: CallbackQuery, session: AsyncSession, settings: Settings) -> None:
+async def list_pages(callback: CallbackQuery, session: AsyncSession, settings: Settings, page:int=0) -> None:
     if not await authorized(callback.from_user.id, session, settings):
         return await deny(callback)
     if callback.message:
-        await safe_edit_text(callback.message, "📝 <b>Страницы</b>", reply_markup=pages_list(await PageRepository(session).all()))
+        items=await PageRepository(session).all();result=paginate(items,page);published=sum(1 for item in items if item.published_revision_id);await safe_edit_text(callback.message, f"📄 <b>Страницы</b>\n\nВсего: <b>{len(items)}</b>\n🟢 Опубликовано: <b>{published}</b>\n🟡 Черновиков: <b>{len(items)-published}</b>\n\n"+("Выберите страницу:" if items else "Пока ничего нет."), reply_markup=pages_list(items,result.page))
     await callback.answer()
+
+@router.callback_query(AdminPageCallback.filter(F.action=="list"))
+async def paged_pages(callback:CallbackQuery,callback_data:AdminPageCallback,session:AsyncSession,settings:Settings)->None:await list_pages(callback,session,settings,callback_data.page)
 
 
 @router.callback_query(AdminPageCallback.filter(F.action == "back"))
-async def pages_back(callback: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
+async def pages_back(callback: CallbackQuery, callback_data:AdminPageCallback,session: AsyncSession, settings: Settings, state: FSMContext) -> None:
     await state.clear()
-    await list_pages(callback, session, settings)
+    await list_pages(callback, session, settings, callback_data.page)
 
 
 @router.callback_query(AdminPageCallback.filter(F.action == "open"))
@@ -248,6 +252,7 @@ async def open_page(callback: CallbackQuery, callback_data: AdminPageCallback, s
                 callback_data=AdminPageCallback(
                     action="back",
                     page_id=page.id,
+                    page=callback_data.page,
                 ).pack(),
             )
         ]

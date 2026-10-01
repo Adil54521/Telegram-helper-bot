@@ -336,6 +336,7 @@ async def open_page(
         await handle_phone(
             callback,
             session,
+            settings,
             button_id,
             language,
         )

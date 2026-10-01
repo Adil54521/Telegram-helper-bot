@@ -17,6 +17,7 @@ from app.utils.wizard import edit_wizard
 from app.ai.service import AIService
 from app.database.repositories.users import upsert_user
 from app.utils.presentation import html_text, text_preview
+from app.utils.pagination import paginate
 router=Router(name="attachments")
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
 async def ok(uid,s,c):return await PermissionService(s,c).has(uid,Permission.CONTENT)
@@ -24,19 +25,21 @@ async def guard(cb,s,c):
     if await ok(cb.from_user.id,s,c):return True
     await cb.answer("Доступ запрещён",show_alert=True);return False
 async def get_item(session,item_id):return await session.get(PageAttachment,item_id)
-async def listing(cb,page_id,session):
+async def listing(cb,page_id,session,current=0):
     page=await PageService(session).ensure_editable_draft(page_id,cb.from_user.id)
     if not page or not page.draft_revision:return await cb.answer("Страница не найдена",show_alert=True)
-    items=sorted(page.draft_revision.attachments,key=lambda x:x.position);active_count=sum(1 for x in items if x.is_active);rows=[[InlineKeyboardButton(text=f"{i+1}. {'🔴 ' if not x.is_active else ''}{'🖼' if x.type==MediaType.PHOTO else '📄'} {text_preview(x.file_name or x.type.value,38)}",callback_data=AttachmentCallback(action="open",item_id=x.id,page_id=page_id).pack())] for i,x in enumerate(items)];rows += [[InlineKeyboardButton(text="➕ Добавить вложение",callback_data=AttachmentCallback(action="add",page_id=page_id).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=AdminPageCallback(action="open",page_id=page_id).pack())]];await safe_edit_text(cb.message,f"📎 <b>Вложения</b>\n\nВсего: <b>{len(items)}</b>\n🟢 Активных: <b>{active_count}</b>",reply_markup=kb(rows));await cb.answer()
+    items=await PageRepository(session).attachments(page.draft_revision.id);result=paginate(items,current);active_count=sum(1 for x in items if x.is_active);rows=[[InlineKeyboardButton(text=f"{i+1}. {'🔴 ' if not x.is_active else ''}{'🖼' if x.type==MediaType.PHOTO else '📄'} {text_preview(x.file_name or x.type.value,38)}",callback_data=AttachmentCallback(action="open",item_id=x.id,page_id=page_id,page=result.page).pack())] for i,x in enumerate(result.items,start=result.page*8)]
+    if result.pages>1:rows.append([InlineKeyboardButton(text="⬅️",callback_data=AttachmentCallback(action="list",page_id=page_id,page=max(0,result.page-1)).pack()),InlineKeyboardButton(text=f"{result.page+1} / {result.pages}",callback_data="noop"),InlineKeyboardButton(text="➡️",callback_data=AttachmentCallback(action="list",page_id=page_id,page=min(result.pages-1,result.page+1)).pack())])
+    rows += [[InlineKeyboardButton(text="➕ Добавить вложение",callback_data=AttachmentCallback(action="add",page_id=page_id,page=result.page).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=AdminPageCallback(action="open",page_id=page_id).pack())]];await safe_edit_text(cb.message,f"📎 <b>Вложения</b>\n\nВсего: <b>{len(items)}</b>\n🟢 Активных: <b>{active_count}</b>\n🔴 Выключено: <b>{len(items)-active_count}</b>\n\n"+("Выберите вложение." if items else "Пока ничего нет."),reply_markup=kb(rows));await cb.answer()
 @router.callback_query(AdminPageCallback.filter(F.action=="attachments"))
 async def menu(cb:CallbackQuery,callback_data:AdminPageCallback,session:AsyncSession,settings:Settings):
-    if await guard(cb,session,settings):await listing(cb,callback_data.page_id,session)
+    if await guard(cb,session,settings):await listing(cb,callback_data.page_id,session,callback_data.page)
 @router.callback_query(AttachmentCallback.filter(F.action=="list"))
 async def list_(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncSession,settings:Settings):
-    if await guard(cb,session,settings):await listing(cb,callback_data.page_id,session)
+    if await guard(cb,session,settings):await listing(cb,callback_data.page_id,session,callback_data.page)
 @router.callback_query(AttachmentCallback.filter(F.action=="add"))
 async def add(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncSession,settings:Settings,state:FSMContext):
-    if await guard(cb,session,settings):await state.set_state(AddAttachment.file);await state.update_data(page_id=callback_data.page_id);await remember_wizard(state,cb.message);await safe_edit_text(cb.message,"📎 <b>Новое вложение</b>\n\nШаг 1 из 2\nОтправьте документ или изображение.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=AttachmentCallback(action="cancel",page_id=callback_data.page_id).pack())]]));await cb.answer()
+    if await guard(cb,session,settings):await state.set_state(AddAttachment.file);await state.update_data(page_id=callback_data.page_id,list_page=callback_data.page);await remember_wizard(state,cb.message);await safe_edit_text(cb.message,"📎 <b>Новое вложение</b>\n\nШаг 1 из 2\nОтправьте документ или изображение.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=AttachmentCallback(action="cancel",page_id=callback_data.page_id,page=callback_data.page).pack())]]));await cb.answer()
 @router.message(AddAttachment.file,F.document|F.photo)
 async def receive(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
     if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
@@ -85,21 +88,21 @@ async def show_attachment_preview(bot,state):
 @router.callback_query(AddAttachment.confirm,AttachmentCallback.filter(F.action=="create"))
 async def create(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext):
     if not await guard(cb,session,settings):await state.clear();return
-    d=await state.get_data();await AttachmentService(session).create(d["page_id"],cb.from_user.id,MediaType(d["type"]),d["file_id"],d.get("file_name"),d.get("caption_ru"),d.get("caption_kk"));await finish_wizard(state,"page_id","type","file_id","file_name","caption_ru","caption_kk");await listing(cb,d["page_id"],session)
+    d=await state.get_data();await AttachmentService(session).create(d["page_id"],cb.from_user.id,MediaType(d["type"]),d["file_id"],d.get("file_name"),d.get("caption_ru"),d.get("caption_kk"));await finish_wizard(state,"page_id","type","file_id","file_name","caption_ru","caption_kk","list_page");await listing(cb,d["page_id"],session,d.get("list_page",0))
 @router.callback_query(AttachmentCallback.filter(F.action=="cancel"))
 async def cancel(cb:CallbackQuery,callback_data:AttachmentCallback,state:FSMContext,session:AsyncSession):
-    d=await state.get_data();page_id=callback_data.page_id or d.get("page_id");await finish_wizard(state,"page_id","type","file_id","file_name");await listing(cb,page_id,session)
+    d=await state.get_data();page_id=callback_data.page_id or d.get("page_id");page=callback_data.page or d.get("list_page",0);await finish_wizard(state,"page_id","type","file_id","file_name","caption_ru","caption_kk","list_page");await listing(cb,page_id,session,page)
 @router.callback_query(AttachmentCallback.filter(F.action=="open"))
 async def open_(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncSession,settings:Settings):
     if not await guard(cb,session,settings):return
     x=await get_item(session,callback_data.item_id)
     if not x:return await cb.answer("Вложение не найдено",show_alert=True)
-    rows=[[InlineKeyboardButton(text="🇷🇺 Подпись RU",callback_data=AttachmentCallback(action="caption",item_id=x.id,page_id=callback_data.page_id,language="ru").pack()),InlineKeyboardButton(text="🇰🇿 Подпись KK",callback_data=AttachmentCallback(action="caption",item_id=x.id,page_id=callback_data.page_id,language="kk").pack())],[InlineKeyboardButton(text="⬆️ Выше",callback_data=AttachmentCallback(action="up",item_id=x.id,page_id=callback_data.page_id).pack()),InlineKeyboardButton(text="⬇️ Ниже",callback_data=AttachmentCallback(action="down",item_id=x.id,page_id=callback_data.page_id).pack())],[InlineKeyboardButton(text="🔴 Выключить" if x.is_active else "🟢 Включить",callback_data=AttachmentCallback(action="toggle",item_id=x.id,page_id=callback_data.page_id).pack())],[InlineKeyboardButton(text="🗑 Удалить",callback_data=AttachmentCallback(action="delete_ask",item_id=x.id,page_id=callback_data.page_id).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=AttachmentCallback(action="list",page_id=callback_data.page_id).pack())]]
+    rows=[[InlineKeyboardButton(text="🇷🇺 Подпись RU",callback_data=AttachmentCallback(action="caption",item_id=x.id,page_id=callback_data.page_id,language="ru",page=callback_data.page).pack()),InlineKeyboardButton(text="🇰🇿 Подпись KK",callback_data=AttachmentCallback(action="caption",item_id=x.id,page_id=callback_data.page_id,language="kk",page=callback_data.page).pack())],[InlineKeyboardButton(text="⬆️ Выше",callback_data=AttachmentCallback(action="up",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack()),InlineKeyboardButton(text="⬇️ Ниже",callback_data=AttachmentCallback(action="down",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack())],[InlineKeyboardButton(text="🔴 Выключить" if x.is_active else "🟢 Включить",callback_data=AttachmentCallback(action="toggle",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack())],[InlineKeyboardButton(text="🗑 Удалить",callback_data=AttachmentCallback(action="delete_ask",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=AttachmentCallback(action="list",page_id=callback_data.page_id,page=callback_data.page).pack())]]
     type_label="🖼 Изображение" if x.type==MediaType.PHOTO else "📄 Документ";card=f"📎 <b>{html_text(x.file_name or type_label)}</b>\n\n{'🟢 Активно' if x.is_active else '🔴 Выключено'}\n\n<b>Тип:</b> {type_label}\n📁 <b>Файл:</b>\n{html_text(x.file_name or '—')}\n\n🇷🇺 <b>Подпись:</b>\n{html_text(x.caption_ru or '—')}\n\n🇰🇿 <b>Қолтаңба:</b>\n{html_text(x.caption_kk or '—')}\n\n📍 Позиция: {x.position+1}"
     await safe_edit_text(cb.message,card,reply_markup=kb(rows));await cb.answer()
 @router.callback_query(AttachmentCallback.filter(F.action=="caption"))
 async def caption(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncSession,settings:Settings,state:FSMContext):
-    if await guard(cb,session,settings):await state.set_state(EditAttachment.caption);await state.update_data(item_id=callback_data.item_id,page_id=callback_data.page_id,language=callback_data.language);await cb.message.answer("Введите подпись:");await cb.answer()
+    if await guard(cb,session,settings):await state.set_state(EditAttachment.caption);await state.update_data(item_id=callback_data.item_id,page_id=callback_data.page_id,language=callback_data.language,list_page=callback_data.page);await cb.message.answer("Введите подпись:");await cb.answer()
 @router.message(EditAttachment.caption)
 async def caption_value(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
     if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
@@ -111,7 +114,8 @@ async def mutate(cb:CallbackQuery,callback_data:AttachmentCallback,session:Async
     x=await get_item(session,callback_data.item_id)
     if not x:return await cb.answer("Вложение не найдено",show_alert=True)
     svc=AttachmentService(session)
-    if callback_data.action in {"up","down"}:await svc.move(x,cb.from_user.id,-1 if callback_data.action=="up" else 1);return await open_(cb,callback_data,session,settings)
+    if callback_data.action in {"up","down"}:
+        await svc.move(x,cb.from_user.id,-1 if callback_data.action=="up" else 1);items=await PageRepository(session).attachments(x.revision_id);new_page=next((index//8 for index,item in enumerate(items) if item.id==x.id),callback_data.page);return await open_(cb,AttachmentCallback(action="open",item_id=x.id,page_id=callback_data.page_id,page=new_page),session,settings)
     if callback_data.action=="toggle":await svc.update(x,cb.from_user.id,is_active=not x.is_active);return await open_(cb,callback_data,session,settings)
-    if callback_data.action=="delete_ask":await safe_edit_text(cb.message,f"⚠️ <b>Удалить вложение «{html_text(x.file_name or x.type.value)}»?</b>\n\nЭто действие нельзя отменить.",reply_markup=kb([[InlineKeyboardButton(text="🔴 Да, удалить",callback_data=AttachmentCallback(action="delete_yes",item_id=x.id,page_id=callback_data.page_id).pack())],[InlineKeyboardButton(text="⬅️ Отмена",callback_data=AttachmentCallback(action="open",item_id=x.id,page_id=callback_data.page_id).pack())]]));return await cb.answer()
-    await svc.delete(x,cb.from_user.id);await listing(cb,callback_data.page_id,session)
+    if callback_data.action=="delete_ask":await safe_edit_text(cb.message,f"⚠️ <b>Удалить вложение «{html_text(x.file_name or x.type.value)}»?</b>\n\nЭто действие нельзя отменить.",reply_markup=kb([[InlineKeyboardButton(text="🔴 Да, удалить",callback_data=AttachmentCallback(action="delete_yes",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack())],[InlineKeyboardButton(text="⬅️ Отмена",callback_data=AttachmentCallback(action="open",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack())]]));return await cb.answer()
+    await svc.delete(x,cb.from_user.id);await listing(cb,callback_data.page_id,session,callback_data.page)

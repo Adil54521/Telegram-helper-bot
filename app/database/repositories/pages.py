@@ -2,7 +2,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.database.models import BotButton, BotPage
+from app.database.models import BotButton, BotPage, PageAttachment
 from app.database.models.enums import ButtonAction
 
 
@@ -28,6 +28,14 @@ class PageRepository:
 
     async def buttons(self, page_id: int) -> list[BotButton]:
         result = await self.session.execute(select(BotButton).where(BotButton.page_id == page_id, BotButton.is_active.is_(True)).order_by(BotButton.row, BotButton.position))
+        return list(result.scalars().all())
+
+    async def attachments(self, revision_id: int) -> list[PageAttachment]:
+        result = await self.session.execute(
+            select(PageAttachment)
+            .where(PageAttachment.revision_id == revision_id)
+            .order_by(PageAttachment.position, PageAttachment.id)
+        )
         return list(result.scalars().all())
 
     async def key_exists(self, key: str) -> bool:

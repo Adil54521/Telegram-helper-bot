@@ -24,6 +24,7 @@ class AdminAICallback(CallbackData, prefix="aai"):
 class AdminPageCallback(CallbackData, prefix="ap"):
     action: str
     page_id: int
+    page: int = 0
 
 
 class AdminMenuCallback(CallbackData, prefix="am"):
@@ -35,6 +36,7 @@ class ButtonCallback(CallbackData, prefix="bt"):
     item_id: int = 0
     page_id: int = 0
     value: str = ""
+    page: int = 0
 
 
 class FAQCallback(CallbackData, prefix="fq"):
@@ -65,3 +67,4 @@ class AttachmentCallback(CallbackData, prefix="att"):
     item_id: int = 0
     page_id: int = 0
     language: str = ""
+    page: int = 0

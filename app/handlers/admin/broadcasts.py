@@ -15,6 +15,7 @@ from app.states.admin import CreateBroadcast
 from app.utils.telegram import safe_edit_text
 from app.utils.presentation import html_text, text_preview
 from app.utils.wizard import consume_input, edit_wizard, finish_wizard, remember_wizard
+from app.utils.pagination import paginate
 router=Router(name="broadcasts");SIZE=8
 logger=logging.getLogger(__name__)
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
@@ -48,7 +49,9 @@ async def prepare(m:Message,state:FSMContext,photo_id:str|None,session:AsyncSess
 @router.callback_query(CreateBroadcast.confirm,BroadcastCallback.filter(F.action=="create_start"))
 async def create_start(cb:CallbackQuery,bot:Bot,session:AsyncSession,settings:Settings,state:FSMContext,session_factory:async_sessionmaker[AsyncSession]):
     if not await guard(cb,session,settings):await state.clear();return
-    d=await state.get_data();item=Broadcast(text=d["text"],media_file_id=d.get("photo"),status=BroadcastStatus.DRAFT,created_by=cb.from_user.id);session.add(item);await session.flush();session.add(AuditLog(admin_id=cb.from_user.id,action="BROADCAST_CREATED",entity_type="Broadcast",entity_id=str(item.id),new_data={"has_photo":bool(item.media_file_id)}));await session.commit();await finish_wizard(state,"text","photo");await safe_edit_text(cb.message,"🚀 <b>Рассылка запущена</b>");await cb.answer()
+    d=await state.get_data();item=Broadcast(text=d["text"],media_file_id=d.get("photo"),status=BroadcastStatus.DRAFT,created_by=cb.from_user.id);session.add(item);await session.flush();metadata={"has_photo":bool(item.media_file_id)}
+    if d.get("source_broadcast_id"):metadata["source_broadcast_id"]=d["source_broadcast_id"]
+    session.add(AuditLog(admin_id=cb.from_user.id,action="BROADCAST_CREATED",entity_type="Broadcast",entity_id=str(item.id),new_data=metadata));await session.commit();await finish_wizard(state,"text","photo","source_broadcast_id","history_page");await safe_edit_text(cb.message,"🚀 <b>Рассылка запущена</b>");await cb.answer()
     async def task():
         try:
             total,sent,failed=await run_broadcast(bot,session_factory,item.id,cb.from_user.id)
@@ -65,14 +68,29 @@ async def create_start(cb:CallbackQuery,bot:Bot,session:AsyncSession,settings:Se
                 logger.warning("Could not notify broadcast owner about failure",exc_info=True)
     asyncio.create_task(task())
 @router.callback_query(BroadcastCallback.filter(F.action=="cancel"))
-async def cancel(cb:CallbackQuery,state:FSMContext,session:AsyncSession,settings:Settings):await finish_wizard(state,"text","photo");await menu(cb,session,settings)
+async def cancel(cb:CallbackQuery,state:FSMContext,session:AsyncSession,settings:Settings):await finish_wizard(state,"text","photo","source_broadcast_id","history_page");await menu(cb,session,settings)
 @router.callback_query(BroadcastCallback.filter(F.action=="history"))
-async def history(cb:CallbackQuery,session:AsyncSession,settings:Settings):
+async def history(cb:CallbackQuery,session:AsyncSession,settings:Settings,callback_data:BroadcastCallback):
     if not await guard(cb,session,settings):return
-    items=await CMSRepository(session).broadcasts();icons={BroadcastStatus.COMPLETED:"✅",BroadcastStatus.FAILED:"❌",BroadcastStatus.DRAFT:"🟡",BroadcastStatus.RUNNING:"🔵",BroadcastStatus.CANCELLED:"⚪"};rows=[[InlineKeyboardButton(text=f"{icons[x.status]} #{x.id} — {x.sent}/{x.total}",callback_data=BroadcastCallback(action="open",item_id=x.id).pack())] for x in items[:SIZE]];rows.append([InlineKeyboardButton(text="⬅️ Назад",callback_data=AdminMenuCallback(section="broadcasts").pack())]);await safe_edit_text(cb.message,"📋 <b>История рассылок</b>",reply_markup=kb(rows));await cb.answer()
+    items=await CMSRepository(session).broadcasts();result=paginate(items,callback_data.page);icons={BroadcastStatus.COMPLETED:"✅",BroadcastStatus.FAILED:"❌",BroadcastStatus.DRAFT:"🟡",BroadcastStatus.RUNNING:"🔵",BroadcastStatus.CANCELLED:"⚪"};rows=[[InlineKeyboardButton(text=f"{icons[x.status]} #{x.id} — {x.created_at:%d.%m.%Y %H:%M}",callback_data=BroadcastCallback(action="open",item_id=x.id,page=result.page).pack())] for x in result.items]
+    if result.pages>1:rows.append([InlineKeyboardButton(text="⬅️",callback_data=BroadcastCallback(action="history",page=max(0,result.page-1)).pack()),InlineKeyboardButton(text=f"{result.page+1} / {result.pages}",callback_data="noop"),InlineKeyboardButton(text="➡️",callback_data=BroadcastCallback(action="history",page=min(result.pages-1,result.page+1)).pack())])
+    rows += [[InlineKeyboardButton(text="➕ Новая рассылка",callback_data=BroadcastCallback(action="new").pack())],[InlineKeyboardButton(text="⬅️ Панель",callback_data=AdminMenuCallback(section="dashboard").pack())]];await safe_edit_text(cb.message,f"📋 <b>История рассылок</b>\n\nВсего: <b>{len(items)}</b>\n\n"+("Выберите рассылку." if items else "Пока ничего нет."),reply_markup=kb(rows));await cb.answer()
 @router.callback_query(BroadcastCallback.filter(F.action=="open"))
 async def open_(cb:CallbackQuery,callback_data:BroadcastCallback,session:AsyncSession,settings:Settings):
     if not await guard(cb,session,settings):return
     x=await CMSRepository(session).broadcast(callback_data.item_id)
     if not x:return await cb.answer("Рассылка не найдена",show_alert=True)
-    snippet=x.text[:200]+("…" if len(x.text)>200 else "");await safe_edit_text(cb.message,f"📢 <b>Рассылка #{x.id}</b>\n\nСтатус: {x.status.value}\nСоздана: {x.created_at:%d.%m.%Y %H:%M}\nСтарт: {x.started_at or '—'}\nЗавершена: {x.finished_at or '—'}\nВсего: {x.total}\nОтправлено: {x.sent}\nОшибок: {x.failed}\nАвтор: <code>{x.created_by}</code>\n\n{snippet}",reply_markup=kb([[InlineKeyboardButton(text="⬅️ Назад",callback_data=BroadcastCallback(action="history").pack())]]));await cb.answer()
+    statuses={BroadcastStatus.COMPLETED:"🟢 Завершена",BroadcastStatus.FAILED:"🔴 Ошибка",BroadcastStatus.DRAFT:"🟡 Черновик",BroadcastStatus.RUNNING:"🔵 Выполняется",BroadcastStatus.CANCELLED:"⚪ Отменена"};await safe_edit_text(cb.message,f"📢 <b>Рассылка #{x.id}</b>\n\n{statuses[x.status]}\n📅 {x.created_at:%d.%m.%Y %H:%M}\n\n👥 Получателей: <b>{x.total}</b>\n✅ Отправлено: <b>{x.sent}</b>\n❌ Ошибок: <b>{x.failed}</b>\n\n📝 <b>Текст:</b>\n{html_text(text_preview(x.text))}\n\n📎 Медиа: {'🖼 Фото' if x.media_file_id else '—'}",reply_markup=kb([[InlineKeyboardButton(text="🔁 Повторить рассылку",callback_data=BroadcastCallback(action="repeat",item_id=x.id,page=callback_data.page).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=BroadcastCallback(action="history",page=callback_data.page).pack())]]));await cb.answer()
+
+@router.callback_query(BroadcastCallback.filter(F.action=="repeat"))
+async def repeat(cb:CallbackQuery,callback_data:BroadcastCallback,session:AsyncSession,settings:Settings,state:FSMContext):
+    if not await guard(cb,session,settings):return
+    source=await CMSRepository(session).broadcast(callback_data.item_id)
+    if not source:return await cb.answer("Рассылка не найдена",show_alert=True)
+    await remember_wizard(state,cb.message);await state.update_data(text=source.text,photo=source.media_file_id,source_broadcast_id=source.id,history_page=callback_data.page);await state.set_state(CreateBroadcast.confirm);count=await CMSRepository(session).recipient_count()
+    await safe_edit_text(cb.message,f"🔁 <b>Повтор рассылки #{source.id}</b>\n\n📝 Текст:\n{html_text(text_preview(source.text))}\n\n📎 Медиа: {'🖼 Фото' if source.media_file_id else '—'}\n\n👥 Текущих получателей: <b>{count}</b>\n\nЭто новая рассылка. Исходная #{source.id} останется без изменений.",reply_markup=kb([[InlineKeyboardButton(text="✏️ Изменить текст",callback_data=BroadcastCallback(action="repeat_text").pack())],[InlineKeyboardButton(text="📎 Изменить медиа",callback_data=BroadcastCallback(action="repeat_media").pack())],[InlineKeyboardButton(text="🚀 Отправить",callback_data=BroadcastCallback(action="create_start").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=BroadcastCallback(action="cancel").pack())]]));await cb.answer()
+
+@router.callback_query(CreateBroadcast.confirm,BroadcastCallback.filter(F.action=="repeat_text"))
+async def repeat_text(cb:CallbackQuery,state:FSMContext):await state.set_state(CreateBroadcast.text);await safe_edit_text(cb.message,"📢 <b>Повтор рассылки</b>\n\nОтправьте новый текст.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=BroadcastCallback(action="cancel").pack())]]));await cb.answer()
+@router.callback_query(CreateBroadcast.confirm,BroadcastCallback.filter(F.action=="repeat_media"))
+async def repeat_media(cb:CallbackQuery,state:FSMContext):await state.set_state(CreateBroadcast.media);await safe_edit_text(cb.message,"📢 <b>Повтор рассылки</b>\n\nОтправьте новое фото или удалите текущее.",reply_markup=kb([[InlineKeyboardButton(text="🗑 Без фото",callback_data=BroadcastCallback(action="no_photo").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=BroadcastCallback(action="cancel").pack())]]));await cb.answer()

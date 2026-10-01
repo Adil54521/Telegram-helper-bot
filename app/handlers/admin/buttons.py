@@ -23,6 +23,7 @@ from app.utils.wizard import consume_input, edit_wizard, finish_wizard, remember
 from app.ai.service import AIService
 from app.database.repositories.users import upsert_user
 from app.utils.presentation import button_action_details, button_action_icon, html_text, text_preview
+from app.utils.pagination import paginate
 
 
 router = Router(name="admin_buttons")
@@ -234,8 +235,10 @@ async def show_list(
     cb: CallbackQuery,
     page_id: int,
     session: AsyncSession,
+    page: int = 0,
 ) -> None:
     items = await CMSRepository(session).buttons(page_id)
+    result=paginate(items,page)
 
     active_count = sum(1 for item in items if item.is_active)
 
@@ -252,11 +255,15 @@ async def show_list(
                     action="open",
                     item_id=x.id,
                     page_id=page_id,
+                    page=result.page,
                 ).pack(),
             )
         ]
-        for i, x in enumerate(items)
+        for i, x in enumerate(result.items,start=result.page*8)
     ]
+
+    if result.pages>1:
+        rows.append([InlineKeyboardButton(text="⬅️",callback_data=ButtonCallback(action="list",page_id=page_id,page=max(0,result.page-1)).pack()),InlineKeyboardButton(text=f"{result.page+1} / {result.pages}",callback_data="noop"),InlineKeyboardButton(text="➡️",callback_data=ButtonCallback(action="list",page_id=page_id,page=min(result.pages-1,result.page+1)).pack())])
 
     rows += [
         [
@@ -265,6 +272,7 @@ async def show_list(
                 callback_data=ButtonCallback(
                     action="add",
                     page_id=page_id,
+                    page=result.page,
                 ).pack(),
             )
         ],
@@ -284,7 +292,7 @@ async def show_list(
             cb.message,
             "🔘 <b>Кнопки страницы</b>\n\n"
             f"Всего: <b>{len(items)}</b>\n"
-            f"🟢 Активных: <b>{active_count}</b>\n\n"
+            f"🟢 Активных: <b>{active_count}</b>\n🔴 Выключено: <b>{len(items)-active_count}</b>\n\n"
             + (
                 "Выберите кнопку."
                 if items
@@ -310,6 +318,7 @@ async def page_buttons(
             cb,
             callback_data.page_id,
             session,
+            callback_data.page,
         )
 
 
@@ -327,6 +336,7 @@ async def list_buttons(
             cb,
             callback_data.page_id,
             session,
+            callback_data.page,
         )
 
 
@@ -360,6 +370,7 @@ async def open_button(
                     action="edit_text_ru",
                     item_id=item.id,
                     page_id=item.page_id,
+                    page=callback_data.page,
                 ).pack(),
             ),
             InlineKeyboardButton(
@@ -368,6 +379,7 @@ async def open_button(
                     action="edit_text_kk",
                     item_id=item.id,
                     page_id=item.page_id,
+                    page=callback_data.page,
                 ).pack(),
             ),
         ],
@@ -378,6 +390,7 @@ async def open_button(
                     action="choose_action",
                     item_id=item.id,
                     page_id=item.page_id,
+                    page=callback_data.page,
                 ).pack(),
             )
         ],
@@ -388,6 +401,7 @@ async def open_button(
                     action="up",
                     item_id=item.id,
                     page_id=item.page_id,
+                    page=callback_data.page,
                 ).pack(),
             ),
             InlineKeyboardButton(
@@ -396,6 +410,7 @@ async def open_button(
                     action="down",
                     item_id=item.id,
                     page_id=item.page_id,
+                    page=callback_data.page,
                 ).pack(),
             ),
         ],
@@ -410,6 +425,7 @@ async def open_button(
                     action="toggle",
                     item_id=item.id,
                     page_id=item.page_id,
+                    page=callback_data.page,
                 ).pack(),
             )
         ],
@@ -420,6 +436,7 @@ async def open_button(
                     action="delete_ask",
                     item_id=item.id,
                     page_id=item.page_id,
+                    page=callback_data.page,
                 ).pack(),
             )
         ],
@@ -429,6 +446,7 @@ async def open_button(
                 callback_data=ButtonCallback(
                     action="list",
                     page_id=item.page_id,
+                    page=callback_data.page,
                 ).pack(),
             )
         ],
@@ -483,7 +501,7 @@ async def add(
         return
 
     await state.set_state(AddButton.text)
-    await state.update_data(page_id=callback_data.page_id,text=None,text_kk=None,action=None,target=None)
+    await state.update_data(page_id=callback_data.page_id,list_page=callback_data.page,text=None,text_kk=None,action=None,target=None)
 
     if cb.message:
         await remember_wizard(state,cb.message)
@@ -840,12 +858,13 @@ async def new_save(
         data.get("text_kk"),
     )
 
-    await finish_wizard(state,"page_id","text","text_kk","action","target")
+    await finish_wizard(state,"page_id","list_page","text","text_kk","action","target")
 
     await show_list(
         cb,
         item.page_id,
         session,
+        data.get("list_page",0),
     )
 
 
@@ -860,8 +879,8 @@ async def new_cancel(
     session: AsyncSession,
 ):
     data=await state.get_data();page_id=data.get("page_id")
-    await finish_wizard(state,"page_id","text","text_kk","action","target")
-    if page_id:await show_list(cb,page_id,session)
+    page=data.get("list_page",0);await finish_wizard(state,"page_id","list_page","text","text_kk","action","target")
+    if page_id:await show_list(cb,page_id,session,page)
     else:await cb.answer()
 
 @router.callback_query(ButtonCallback.filter(F.action=="new_back_action"))
@@ -918,6 +937,7 @@ async def mutate(
             if callback_data.action == "up"
             else 1,
         )
+        moved_items=await CMSRepository(session).buttons(item.page_id);new_page=next((index//8 for index,value in enumerate(moved_items) if value.id==item.id),callback_data.page)
 
         return await open_button(
             cb,
@@ -925,6 +945,7 @@ async def mutate(
                 action="open",
                 item_id=item.id,
                 page_id=item.page_id,
+                page=new_page,
             ),
             session,
             settings,
@@ -943,6 +964,7 @@ async def mutate(
                 action="open",
                 item_id=item.id,
                 page_id=item.page_id,
+                page=callback_data.page,
             ),
             session,
             settings,
@@ -963,6 +985,7 @@ async def mutate(
                                     action="delete_yes",
                                     item_id=item.id,
                                     page_id=item.page_id,
+                                    page=callback_data.page,
                                 ).pack(),
                             )
                         ],
@@ -973,6 +996,7 @@ async def mutate(
                                     action="open",
                                     item_id=item.id,
                                     page_id=item.page_id,
+                                    page=callback_data.page,
                                 ).pack(),
                             )
                         ],
@@ -993,6 +1017,7 @@ async def mutate(
         cb,
         page_id,
         session,
+        callback_data.page,
     )
 
 
@@ -1038,6 +1063,7 @@ async def edit_text(
         item_id=callback_data.item_id,
         mode="text",
         language=language,
+        list_page=callback_data.page,
     )
 
     if cb.message:
@@ -1075,6 +1101,7 @@ async def choose_existing_action(
                     item_id=callback_data.item_id,
                     page_id=callback_data.page_id,
                     value=value,
+                    page=callback_data.page,
                 ).pack(),
             )
         ]
@@ -1086,7 +1113,7 @@ async def choose_existing_action(
         "🎯 <b>Выберите действие кнопки</b>\n\n"
         "📄 Навигация\n"
         "🔗 Ссылки и контакты",
-        reply_markup=kb(rows + [[InlineKeyboardButton(text="❌ Отмена", callback_data=ButtonCallback(action="open", item_id=callback_data.item_id, page_id=callback_data.page_id).pack())]]),
+        reply_markup=kb(rows + [[InlineKeyboardButton(text="❌ Отмена", callback_data=ButtonCallback(action="open", item_id=callback_data.item_id, page_id=callback_data.page_id,page=callback_data.page).pack())]]),
     )
 
     await cb.answer()
@@ -1155,6 +1182,7 @@ async def set_existing_action(
                 action="open",
                 item_id=item.id,
                 page_id=item.page_id,
+                page=callback_data.page,
             ),
             session,
             settings,

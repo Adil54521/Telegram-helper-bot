@@ -35,8 +35,11 @@ class CMSRepository:
     async def admin_by_telegram(self, telegram_id: int) -> Admin | None:
         return await self.session.scalar(select(Admin).where(Admin.telegram_id == telegram_id))
 
-    async def broadcasts(self, limit: int = 50) -> list[Broadcast]:
-        return list((await self.session.scalars(select(Broadcast).order_by(Broadcast.id.desc()).limit(limit))).all())
+    async def broadcasts(self, limit: int | None = None) -> list[Broadcast]:
+        query = select(Broadcast).order_by(Broadcast.id.desc())
+        if limit is not None:
+            query = query.limit(limit)
+        return list((await self.session.scalars(query)).all())
 
     async def broadcast(self, item_id: int, *, lock: bool = False) -> Broadcast | None:
         query = select(Broadcast).where(Broadcast.id == item_id)
