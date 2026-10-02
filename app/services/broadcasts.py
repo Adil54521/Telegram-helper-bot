@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.database.models import AuditLog, Broadcast, TelegramUser
 from app.database.models.enums import BroadcastStatus
 from app.database.repositories.cms import CMSRepository
+from app.utils.presentation import html_text
 
 async def claim(session:AsyncSession,item_id:int,actor:int)->Broadcast|None:
     item=await CMSRepository(session).broadcast(item_id,lock=True)
@@ -21,14 +22,14 @@ async def run_broadcast(bot:Bot,factory:async_sessionmaker[AsyncSession],item_id
     sent=failed=0
     for user in recipients:
         try:
-            if photo:await bot.send_photo(user.telegram_id,photo=photo,caption=text)
-            else:await bot.send_message(user.telegram_id,text)
+            if photo:await bot.send_photo(user.telegram_id,photo=photo,caption=html_text(text))
+            else:await bot.send_message(user.telegram_id,html_text(text))
             sent+=1
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after+0.1)
             try:
-                if photo:await bot.send_photo(user.telegram_id,photo=photo,caption=text)
-                else:await bot.send_message(user.telegram_id,text)
+                if photo:await bot.send_photo(user.telegram_id,photo=photo,caption=html_text(text))
+                else:await bot.send_message(user.telegram_id,html_text(text))
                 sent+=1
             except Exception:failed+=1
         except TelegramForbiddenError:

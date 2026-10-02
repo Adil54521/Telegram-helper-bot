@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
@@ -8,8 +10,10 @@ from app.config import Settings
 from app.keyboards.admin import dashboard
 from app.services.permissions import PermissionService
 from app.utils.telegram import safe_edit_text
+from app.handlers.user.pages import send_page
 
 router = Router(name="admin_dashboard")
+logger = logging.getLogger(__name__)
 
 
 @router.callback_query(F.data == "noop")
@@ -23,7 +27,8 @@ async def admin(message: Message, session: AsyncSession, settings: Settings) -> 
         return
     role = await PermissionService(session, settings).role_for(message.from_user.id)
     if not role:
-        await message.answer("⛔ Доступ запрещён.")
+        logger.info("Unauthorized admin entry user_id=%s", message.from_user.id)
+        await send_page(message, session, "main", ai_available=settings.ai_available)
         return
     await message.answer("⚙️ <b>Панель управления</b>\n\nУправление содержимым Telegram-бота", reply_markup=dashboard(role))
 

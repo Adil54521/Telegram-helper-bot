@@ -38,6 +38,14 @@ class PageRepository:
         )
         return list(result.scalars().all())
 
+    async def attachment(self, revision_id: int, item_id: int) -> PageAttachment | None:
+        return await self.session.scalar(
+            select(PageAttachment).where(
+                PageAttachment.id == item_id,
+                PageAttachment.revision_id == revision_id,
+            )
+        )
+
     async def key_exists(self, key: str) -> bool:
         return (await self.session.scalar(select(BotPage.id).where(BotPage.key == key).limit(1))) is not None
 

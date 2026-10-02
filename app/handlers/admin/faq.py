@@ -19,8 +19,11 @@ from app.services.faq_csv import FAQCSVRow, export_faq_csv, faq_template_csv, no
 from app.utils.telegram import safe_edit_text
 from app.utils.wizard import consume_input, edit_wizard, finish_wizard, remember_wizard
 from app.utils.presentation import html_text, text_preview
+from app.filters.admin import HasPermission
 
 router=Router(name="admin_faq"); SIZE=8
+router.callback_query.filter(HasPermission(Permission.FAQ))
+router.message.filter(HasPermission(Permission.FAQ))
 IMPORT_KEYS=("import_rows","import_duplicates","import_errors","import_total","translation_faq_ids","ai_faq_translations","ai_edit_id","ai_edit_field","ai_edit_page")
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
 async def ok(uid,s,c):return await PermissionService(s,c).has(uid,Permission.FAQ)

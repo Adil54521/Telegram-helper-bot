@@ -1,6 +1,6 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.callbacks import LanguageCallback, UserAICallback, UserNavigationCallback, UserPageCallback
+from app.callbacks import LanguageCallback, UserAICallback, UserAttachmentCallback, UserNavigationCallback, UserPageCallback
 from app.database.models import BotButton
 from app.database.models.enums import ButtonAction
 from app.utils.i18n import t, translated
@@ -163,6 +163,8 @@ def page_keyboard(
     language: str = "ru",
     ai_available: bool = False,
     page_key: str = "main",
+    attachment_count: int = 0,
+    page_id: int = 0,
 ) -> InlineKeyboardMarkup:
     """
     Создаёт пользовательскую клавиатуру страницы.
@@ -190,6 +192,9 @@ def page_keyboard(
         rows[row]
         for row in sorted(rows)
     ]
+
+    if attachment_count > 0 and page_id > 0:
+        result.append([InlineKeyboardButton(text=f"📎 {t('materials', language)} ({attachment_count})", callback_data=UserAttachmentCallback(action="list", page_id=page_id).pack())])
 
     if page_key == "main" and ai_available:
         result.append([InlineKeyboardButton(text=t("ask_ai", language), callback_data=UserAICallback(action="ask").pack())])

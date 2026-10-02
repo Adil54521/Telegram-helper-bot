@@ -12,7 +12,11 @@ from app.states.admin import AddAdmin
 from app.utils.telegram import safe_edit_text
 from app.utils.wizard import consume_input, finish_wizard, remember_wizard
 from app.utils.pagination import paginate
+from app.utils.presentation import html_text
+from app.filters.admin import HasPermission
 router=Router(name="admins")
+router.callback_query.filter(HasPermission(Permission.ADMINS))
+router.message.filter(HasPermission(Permission.ADMINS))
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
 async def guard(cb,s,c):
     if await PermissionService(s,c).has(cb.from_user.id,Permission.ADMINS):return True
@@ -35,7 +39,7 @@ async def open_(cb:CallbackQuery,callback_data:AdminCallback,session:AsyncSessio
     x=await CMSRepository(session).admin(callback_data.item_id)
     if not x:return await cb.answer("Администратор не найден",show_alert=True)
     rows=[[InlineKeyboardButton(text="🔄 Изменить роль",callback_data=AdminCallback(action="role",item_id=x.id,page=callback_data.page).pack())],[InlineKeyboardButton(text="🔴 Отключить" if x.is_active else "🟢 Включить",callback_data=AdminCallback(action="toggle",item_id=x.id,page=callback_data.page).pack())],[InlineKeyboardButton(text="🗑 Удалить",callback_data=AdminCallback(action="delete_ask",item_id=x.id,page=callback_data.page).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=AdminCallback(action="list",page=callback_data.page).pack())]]
-    await safe_edit_text(cb.message,f"👤 <b>Администратор</b>\n\nTelegram ID: <code>{x.telegram_id}</code>\nИмя: {x.display_name or '—'}\nРоль: {x.role.value}\nАктивен: {'да' if x.is_active else 'нет'}\nСоздан: {x.created_at:%d.%m.%Y %H:%M}",reply_markup=kb(rows));await cb.answer()
+    await safe_edit_text(cb.message,f"👤 <b>Администратор</b>\n\nTelegram ID: <code>{x.telegram_id}</code>\nИмя: {html_text(x.display_name or '—')}\nРоль: {x.role.value}\nАктивен: {'да' if x.is_active else 'нет'}\nСоздан: {x.created_at:%d.%m.%Y %H:%M}",reply_markup=kb(rows));await cb.answer()
 @router.callback_query(AdminCallback.filter(F.action=="add"))
 async def add(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext):
     if await guard(cb,session,settings):await state.set_state(AddAdmin.telegram_id);await remember_wizard(state,cb.message);await safe_edit_text(cb.message,"👤 <b>Новый администратор</b>\n\nШаг 1 из 2\n<b>Telegram ID</b>\n\nОтправьте Telegram ID пользователя.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=AdminCallback(action="cancel").pack())]]));await cb.answer()

@@ -12,12 +12,12 @@ from app.database.repositories.pages import PageRepository
 from app.database.repositories.users import upsert_user
 from app.keyboards.user import language_keyboard, page_keyboard
 from app.utils.i18n import (
-    attachment_caption,
     normalize_language,
     t,
     translated,
 )
 from app.utils.telegram import safe_edit_text
+from app.utils.presentation import html_text
 import logging
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ async def send_page(
     key: str,
     language: str | None = None,
     ai_available: bool = False,
+    track_view: bool = True,
 ) -> bool:
     repo = PageRepository(session)
 
@@ -87,22 +88,27 @@ async def send_page(
             body = revision.text
 
         text = (
-            f"<b>{title}</b>\n\n"
-            f"{body}"
+            f"<b>{html_text(title)}</b>\n\n"
+            f"{html_text(body)}"
         )
 
         buttons = await repo.buttons(
             page.id
         )
 
+        attachments = await repo.attachments(revision.id)
+        attachment_count = sum(1 for attachment in attachments if attachment.is_active)
+
         markup = page_keyboard(
             buttons,
             language,
             ai_available,
             key,
+            attachment_count,
+            page.id,
         )
 
-        if user:
+        if user and track_view:
             session.add(
                 PageView(
                     user_id=user.id,
@@ -128,50 +134,6 @@ async def send_page(
             text,
             reply_markup=markup,
         )
-
-    if (
-        page
-        and page.published_revision
-    ):
-        attachments = sorted(
-            (
-                attachment
-                for attachment
-                in page.published_revision.attachments
-                if attachment.is_active
-            ),
-            key=lambda attachment: attachment.position,
-        )
-
-        recipient = (
-            target.message
-            if isinstance(
-                target,
-                CallbackQuery,
-            )
-            else target
-        )
-
-        if not recipient:
-            return True
-
-        for attachment in attachments:
-            caption = attachment_caption(
-                attachment,
-                language,
-            )
-
-            if attachment.type.value == "PHOTO":
-                await recipient.answer_photo(
-                    attachment.telegram_file_id,
-                    caption=caption,
-                )
-
-            else:
-                await recipient.answer_document(
-                    attachment.telegram_file_id,
-                    caption=caption,
-                )
 
     return bool(page and page.is_active and page.published_revision)
 
@@ -213,14 +175,14 @@ async def handle_phone(
     if language == "kk":
         text = (
             "📞 Телефон нөмірі:\n\n"
-            f"<code>{phone}</code>\n\n"
+            f"<code>{html_text(phone)}</code>\n\n"
             "Нөмірді көшіру үшін оны басып тұрыңыз."
         )
 
     else:
         text = (
             "📞 Номер телефона:\n\n"
-            f"<code>{phone}</code>\n\n"
+            f"<code>{html_text(phone)}</code>\n\n"
             "Нажмите и удерживайте номер, чтобы скопировать."
         )
 
@@ -263,14 +225,14 @@ async def handle_email(
     if language == "kk":
         text = (
             "✉️ Электрондық пошта:\n\n"
-            f"<code>{email}</code>\n\n"
+            f"<code>{html_text(email)}</code>\n\n"
             "Мекенжайды көшіру үшін оны басып тұрыңыз."
         )
 
     else:
         text = (
             "✉️ Электронная почта:\n\n"
-            f"<code>{email}</code>\n\n"
+            f"<code>{html_text(email)}</code>\n\n"
             "Нажмите и удерживайте адрес, чтобы скопировать."
         )
 

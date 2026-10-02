@@ -137,13 +137,17 @@ def export_faq_csv(items: list[FAQItem]) -> bytes:
         ru = next((value for value in item.translations if value.language_code == LanguageCode.RU), None)
         kk = next((value for value in item.translations if value.language_code == LanguageCode.KK), None)
         writer.writerow({
-            "question_ru": ru.question if ru else item.question,
-            "answer_ru": ru.answer if ru else item.answer,
-            "question_kk": kk.question if kk else "",
-            "answer_kk": kk.answer if kk else "",
+            "question_ru": _spreadsheet_safe(ru.question if ru else item.question),
+            "answer_ru": _spreadsheet_safe(ru.answer if ru else item.answer),
+            "question_kk": _spreadsheet_safe(kk.question if kk else ""),
+            "answer_kk": _spreadsheet_safe(kk.answer if kk else ""),
             "is_active": "true" if item.is_active else "false",
         })
     return stream.getvalue().encode("utf-8-sig")
+
+
+def _spreadsheet_safe(value: str) -> str:
+    return f"'{value}" if value.startswith(("=", "+", "-", "@")) else value
 
 
 def faq_template_csv() -> bytes:

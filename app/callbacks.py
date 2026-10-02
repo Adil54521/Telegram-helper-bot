@@ -47,6 +47,14 @@ class FAQCallback(CallbackData, prefix="fq"):
 
 class UserFAQCallback(CallbackData, prefix="uf"):
     item_id: int = 0
+    page: int = 0
+
+
+class UserAttachmentCallback(CallbackData, prefix="ua"):
+    action: str
+    page_id: int
+    item_id: int = 0
+    page: int = 0
 
 
 class AdminCallback(CallbackData, prefix="ad"):

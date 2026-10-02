@@ -11,8 +11,11 @@ class CMSRepository:
     async def buttons(self, page_id: int) -> list[BotButton]:
         return list((await self.session.scalars(select(BotButton).where(BotButton.page_id == page_id).order_by(BotButton.row, BotButton.position, BotButton.id))).all())
 
-    async def button(self, item_id: int) -> BotButton | None:
-        return await self.session.get(BotButton, item_id)
+    async def button(self, item_id: int, page_id: int | None = None) -> BotButton | None:
+        query = select(BotButton).where(BotButton.id == item_id)
+        if page_id is not None:
+            query = query.where(BotButton.page_id == page_id)
+        return await self.session.scalar(query)
 
     async def faqs(self, active_only: bool = False) -> list[FAQItem]:
         query = select(FAQItem).order_by(FAQItem.position, FAQItem.id)

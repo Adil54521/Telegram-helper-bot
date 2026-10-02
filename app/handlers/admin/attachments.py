@@ -18,13 +18,20 @@ from app.ai.service import AIService
 from app.database.repositories.users import upsert_user
 from app.utils.presentation import html_text, text_preview
 from app.utils.pagination import paginate
+from app.filters.admin import HasPermission
 router=Router(name="attachments")
+router.callback_query.filter(HasPermission(Permission.CONTENT))
+router.message.filter(HasPermission(Permission.CONTENT))
+MAX_ATTACHMENT_BYTES=20_000_000
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
 async def ok(uid,s,c):return await PermissionService(s,c).has(uid,Permission.CONTENT)
 async def guard(cb,s,c):
     if await ok(cb.from_user.id,s,c):return True
     await cb.answer("Доступ запрещён",show_alert=True);return False
-async def get_item(session,item_id):return await session.get(PageAttachment,item_id)
+async def get_item(session,item_id,page_id,actor):
+    page=await PageService(session).ensure_editable_draft(page_id,actor)
+    if not page or not page.draft_revision:return None
+    return await PageRepository(session).attachment(page.draft_revision.id,item_id)
 async def listing(cb,page_id,session,current=0):
     page=await PageService(session).ensure_editable_draft(page_id,cb.from_user.id)
     if not page or not page.draft_revision:return await cb.answer("Страница не найдена",show_alert=True)
@@ -43,6 +50,8 @@ async def add(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncSes
 @router.message(AddAttachment.file,F.document|F.photo)
 async def receive(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
     if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
+    size=m.document.file_size if m.document else m.photo[-1].file_size
+    if size and size>MAX_ATTACHMENT_BYTES:return await m.answer("Файл слишком большой (максимум 20 МБ).")
     if m.document:type_,file_id,name=MediaType.DOCUMENT,m.document.file_id,m.document.file_name
     else:type_,file_id,name=MediaType.PHOTO,m.photo[-1].file_id,"image.jpg"
     await state.update_data(type=type_.value,file_id=file_id,file_name=name,caption_ru=None,caption_kk=None);await consume_input(m);await state.set_state(AddAttachment.caption_ru)
@@ -95,7 +104,7 @@ async def cancel(cb:CallbackQuery,callback_data:AttachmentCallback,state:FSMCont
 @router.callback_query(AttachmentCallback.filter(F.action=="open"))
 async def open_(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncSession,settings:Settings):
     if not await guard(cb,session,settings):return
-    x=await get_item(session,callback_data.item_id)
+    x=await get_item(session,callback_data.item_id,callback_data.page_id,cb.from_user.id)
     if not x:return await cb.answer("Вложение не найдено",show_alert=True)
     rows=[[InlineKeyboardButton(text="🇷🇺 Подпись RU",callback_data=AttachmentCallback(action="caption",item_id=x.id,page_id=callback_data.page_id,language="ru",page=callback_data.page).pack()),InlineKeyboardButton(text="🇰🇿 Подпись KK",callback_data=AttachmentCallback(action="caption",item_id=x.id,page_id=callback_data.page_id,language="kk",page=callback_data.page).pack())],[InlineKeyboardButton(text="⬆️ Выше",callback_data=AttachmentCallback(action="up",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack()),InlineKeyboardButton(text="⬇️ Ниже",callback_data=AttachmentCallback(action="down",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack())],[InlineKeyboardButton(text="🔴 Выключить" if x.is_active else "🟢 Включить",callback_data=AttachmentCallback(action="toggle",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack())],[InlineKeyboardButton(text="🗑 Удалить",callback_data=AttachmentCallback(action="delete_ask",item_id=x.id,page_id=callback_data.page_id,page=callback_data.page).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=AttachmentCallback(action="list",page_id=callback_data.page_id,page=callback_data.page).pack())]]
     type_label="🖼 Изображение" if x.type==MediaType.PHOTO else "📄 Документ";card=f"📎 <b>{html_text(x.file_name or type_label)}</b>\n\n{'🟢 Активно' if x.is_active else '🔴 Выключено'}\n\n<b>Тип:</b> {type_label}\n📁 <b>Файл:</b>\n{html_text(x.file_name or '—')}\n\n🇷🇺 <b>Подпись:</b>\n{html_text(x.caption_ru or '—')}\n\n🇰🇿 <b>Қолтаңба:</b>\n{html_text(x.caption_kk or '—')}\n\n📍 Позиция: {x.position+1}"
@@ -106,12 +115,12 @@ async def caption(cb:CallbackQuery,callback_data:AttachmentCallback,session:Asyn
 @router.message(EditAttachment.caption)
 async def caption_value(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
     if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
-    d=await state.get_data();x=await get_item(session,d["item_id"])
+    d=await state.get_data();x=await get_item(session,d["item_id"],d["page_id"],m.from_user.id)
     if x and m.text:await AttachmentService(session).update(x,m.from_user.id,**{f"caption_{d['language']}":m.text});await state.clear();await m.answer("✅ Подпись обновлена.")
 @router.callback_query(AttachmentCallback.filter(F.action.in_({"up","down","toggle","delete_ask","delete_yes"})))
 async def mutate(cb:CallbackQuery,callback_data:AttachmentCallback,session:AsyncSession,settings:Settings):
     if not await guard(cb,session,settings):return
-    x=await get_item(session,callback_data.item_id)
+    x=await get_item(session,callback_data.item_id,callback_data.page_id,cb.from_user.id)
     if not x:return await cb.answer("Вложение не найдено",show_alert=True)
     svc=AttachmentService(session)
     if callback_data.action in {"up","down"}:

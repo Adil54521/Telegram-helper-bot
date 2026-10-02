@@ -18,9 +18,12 @@ from app.services.permissions import Permission, PermissionService
 from app.states.admin import TestAIRetrieval
 from app.utils.presentation import html_text, text_preview
 from app.utils.telegram import safe_edit_text
+from app.filters.admin import HasPermission
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_ai")
+router.callback_query.filter(HasPermission(Permission.STATISTICS))
+router.message.filter(HasPermission(Permission.STATISTICS))
 def ai_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

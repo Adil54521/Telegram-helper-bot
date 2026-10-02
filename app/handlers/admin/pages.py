@@ -18,8 +18,11 @@ from app.utils.telegram import safe_edit_text
 from app.utils.i18n import translated
 from app.utils.presentation import html_text, text_preview
 from app.utils.pagination import paginate
+from app.filters.admin import HasPermission
 
 router = Router(name="admin_pages")
+router.callback_query.filter(HasPermission(Permission.CONTENT))
+router.message.filter(HasPermission(Permission.CONTENT))
 
 
 async def authorized(user_id: int, session: AsyncSession, settings: Settings) -> bool:

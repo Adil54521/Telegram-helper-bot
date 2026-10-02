@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections import defaultdict
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -16,8 +17,13 @@ from app.utils.telegram import safe_edit_text
 from app.utils.presentation import html_text, text_preview
 from app.utils.wizard import consume_input, edit_wizard, finish_wizard, remember_wizard
 from app.utils.pagination import paginate
+from app.filters.admin import HasPermission
 router=Router(name="broadcasts");SIZE=8
+router.callback_query.filter(HasPermission(Permission.BROADCAST))
+router.message.filter(HasPermission(Permission.BROADCAST))
 logger=logging.getLogger(__name__)
+_confirm_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+MAX_BROADCAST_PHOTO_BYTES = 20_000_000
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
 async def ok(uid,s,c):return await PermissionService(s,c).has(uid,Permission.BROADCAST)
 async def guard(cb,s,c):
@@ -38,6 +44,7 @@ async def text(m:Message,session:AsyncSession,settings:Settings,state:FSMContext
 @router.message(CreateBroadcast.media,F.photo)
 async def photo(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
     if not m.from_user or not await ok(m.from_user.id,session,settings):await state.clear();return
+    if m.photo[-1].file_size and m.photo[-1].file_size > MAX_BROADCAST_PHOTO_BYTES:return await m.answer("Фото слишком большое (максимум 20 МБ).")
     photo_id=m.photo[-1].file_id;await consume_input(m);await prepare(m,state,photo_id,session)
 @router.callback_query(CreateBroadcast.media,BroadcastCallback.filter(F.action=="no_photo"))
 async def no_photo(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext):
@@ -49,9 +56,13 @@ async def prepare(m:Message,state:FSMContext,photo_id:str|None,session:AsyncSess
 @router.callback_query(CreateBroadcast.confirm,BroadcastCallback.filter(F.action=="create_start"))
 async def create_start(cb:CallbackQuery,bot:Bot,session:AsyncSession,settings:Settings,state:FSMContext,session_factory:async_sessionmaker[AsyncSession]):
     if not await guard(cb,session,settings):await state.clear();return
-    d=await state.get_data();item=Broadcast(text=d["text"],media_file_id=d.get("photo"),status=BroadcastStatus.DRAFT,created_by=cb.from_user.id);session.add(item);await session.flush();metadata={"has_photo":bool(item.media_file_id)}
-    if d.get("source_broadcast_id"):metadata["source_broadcast_id"]=d["source_broadcast_id"]
-    session.add(AuditLog(admin_id=cb.from_user.id,action="BROADCAST_CREATED",entity_type="Broadcast",entity_id=str(item.id),new_data=metadata));await session.commit();await finish_wizard(state,"text","photo","source_broadcast_id","history_page");await safe_edit_text(cb.message,"🚀 <b>Рассылка запущена</b>");await cb.answer()
+    async with _confirm_locks[cb.from_user.id]:
+        d=await state.get_data()
+        if d.get("broadcast_starting") or not d.get("text"):return await cb.answer("Рассылка уже запускается",show_alert=True)
+        await state.update_data(broadcast_starting=True)
+        item=Broadcast(text=d["text"],media_file_id=d.get("photo"),status=BroadcastStatus.DRAFT,created_by=cb.from_user.id);session.add(item);await session.flush();metadata={"has_photo":bool(item.media_file_id)}
+        if d.get("source_broadcast_id"):metadata["source_broadcast_id"]=d["source_broadcast_id"]
+        session.add(AuditLog(admin_id=cb.from_user.id,action="BROADCAST_CREATED",entity_type="Broadcast",entity_id=str(item.id),new_data=metadata));await session.commit();await finish_wizard(state,"text","photo","source_broadcast_id","history_page","broadcast_starting");await safe_edit_text(cb.message,"🚀 <b>Рассылка запущена</b>");await cb.answer()
     async def task():
         try:
             total,sent,failed=await run_broadcast(bot,session_factory,item.id,cb.from_user.id)

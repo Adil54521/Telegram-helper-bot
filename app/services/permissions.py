@@ -36,5 +36,6 @@ class PermissionService:
 
     async def has(self, telegram_id: int, permission: Permission) -> bool:
         role = await self.role_for(telegram_id)
-        return bool(role and permission in ROLE_PERMISSIONS[role])
-
+        if not isinstance(permission, Permission):
+            return False
+        return bool(role and permission in ROLE_PERMISSIONS.get(role, set()))

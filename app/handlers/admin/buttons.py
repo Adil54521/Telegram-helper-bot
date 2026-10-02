@@ -24,9 +24,12 @@ from app.ai.service import AIService
 from app.database.repositories.users import upsert_user
 from app.utils.presentation import button_action_details, button_action_icon, html_text, text_preview
 from app.utils.pagination import paginate
+from app.filters.admin import HasPermission
 
 
 router = Router(name="admin_buttons")
+router.callback_query.filter(HasPermission(Permission.CONTENT))
+router.message.filter(HasPermission(Permission.CONTENT))
 
 MAX_BUTTON_TEXT_LENGTH = 128
 
@@ -353,7 +356,7 @@ async def open_button(
         return
 
     item = await CMSRepository(session).button(
-        callback_data.item_id
+        callback_data.item_id, callback_data.page_id
     )
 
     if not item:
@@ -663,7 +666,6 @@ async def new_type(
                     callback_data=ButtonCallback(
                         action="new_target",
                         item_id=page.id,
-                        value=page.key,
                     ).pack(),
                 )
             ]
@@ -738,11 +740,10 @@ async def new_target(
         await state.clear()
         return
 
-    await preview_new(
-        cb,
-        state,
-        callback_data.value,
-    )
+    page = await PageRepository(session).by_id(callback_data.item_id)
+    if not page or not page.is_active:
+        return await cb.answer("Страница недоступна", show_alert=True)
+    await preview_new(cb, state, page.key)
 
     await cb.answer()
 
@@ -915,7 +916,7 @@ async def mutate(
     item = await CMSRepository(
         session
     ).button(
-        callback_data.item_id
+        callback_data.item_id, callback_data.page_id
     )
 
     if not item:
@@ -1061,6 +1062,7 @@ async def edit_text(
 
     await state.update_data(
         item_id=callback_data.item_id,
+        page_id=callback_data.page_id,
         mode="text",
         language=language,
         list_page=callback_data.page,
@@ -1141,7 +1143,7 @@ async def set_existing_action(
     item = await CMSRepository(
         session
     ).button(
-        callback_data.item_id
+        callback_data.item_id, callback_data.page_id
     )
 
     if not item:
@@ -1205,7 +1207,7 @@ async def set_existing_action(
                         action="set_page",
                         item_id=item.id,
                         page_id=item.page_id,
-                        value=page.key,
+                        value=str(page.id),
                     ).pack(),
                 )
             ]
@@ -1227,6 +1229,7 @@ async def set_existing_action(
 
     await state.update_data(
         item_id=item.id,
+        page_id=item.page_id,
         mode="target",
         action=action,
     )
@@ -1279,14 +1282,14 @@ async def set_existing_page(
     item = await CMSRepository(
         session
     ).button(
-        callback_data.item_id
+        callback_data.item_id, callback_data.page_id
     )
 
-    page = await PageRepository(
-        session
-    ).by_key(
-        callback_data.value
-    )
+    try:
+        target_page_id = int(callback_data.value)
+    except ValueError:
+        return await cb.answer("Страница недоступна", show_alert=True)
+    page = await PageRepository(session).by_id(target_page_id)
 
     if (
         not item
@@ -1341,7 +1344,7 @@ async def save_edit(
     item = await CMSRepository(
         session
     ).button(
-        data["item_id"]
+        data["item_id"], data.get("page_id")
     )
 
     if not item:

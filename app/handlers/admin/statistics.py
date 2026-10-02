@@ -7,8 +7,11 @@ from app.config import Settings
 from app.services.permissions import Permission, PermissionService
 from app.services.statistics import user_statistics
 from app.utils.telegram import safe_edit_text
+from app.filters.admin import HasPermission
 
 router = Router(name="statistics")
+router.callback_query.filter(HasPermission(Permission.STATISTICS))
+router.message.filter(HasPermission(Permission.STATISTICS))
 
 
 @router.callback_query(AdminMenuCallback.filter(F.section == "statistics"))
