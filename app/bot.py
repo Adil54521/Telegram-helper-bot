@@ -3,7 +3,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatType, ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ErrorEvent
 
@@ -19,6 +19,25 @@ from app.ai.index import KnowledgeIndexService
 from app.ai.provider import GeminiProvider
 from app.ai.service import AIService
 from app.utils.logging import configure_logging
+
+
+async def handle_update_error(event: ErrorEvent, logger: logging.Logger) -> bool:
+    logger.exception("Unhandled update error", exc_info=event.exception)
+    callback = event.update.callback_query
+    message = (
+        event.update.message
+        or event.update.edited_message
+        or event.update.channel_post
+        or event.update.edited_channel_post
+        or (callback.message if callback else None)
+    )
+    if message and message.chat.type != ChatType.PRIVATE:
+        return True
+    if callback:
+        await callback.answer("⚠️ Произошла ошибка. Попробуйте ещё раз.", show_alert=True)
+    elif message:
+        await message.answer("⚠️ Произошла ошибка. Попробуйте ещё раз.")
+    return True
 
 
 async def main() -> None:
@@ -65,12 +84,7 @@ async def main() -> None:
 
     @dispatcher.error()
     async def error_handler(event: ErrorEvent) -> bool:
-        logger.exception("Unhandled update error", exc_info=event.exception)
-        if event.update.callback_query:
-            await event.update.callback_query.answer("⚠️ Произошла ошибка. Попробуйте ещё раз.", show_alert=True)
-        elif event.update.message:
-            await event.update.message.answer("⚠️ Произошла ошибка. Попробуйте ещё раз.")
-        return True
+        return await handle_update_error(event, logger)
 
     logger.info("Bot polling started")
     try:

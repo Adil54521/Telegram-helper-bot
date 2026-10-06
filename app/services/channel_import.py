@@ -17,6 +17,7 @@ MAX_TRANSFER_DOCUMENT_SIZE = 20 * 1024 * 1024
 class IngestResult:
     post: TelegramContentPost
     created: bool
+    media_count: int
 
 
 def source_text(post: TelegramContentPost) -> str:
@@ -72,18 +73,19 @@ class TelegramContentImportService:
                 post.caption = message.caption
             if edited and message.date:
                 post.telegram_created_at = message.date
+        media_count, media_exists = await self.repo.media_state(post.id, message_id)
         media = message_media(message)
-        if media and post.status == TelegramContentStatus.NEW and not any(item.source_message_id == message_id for item in post.media):
+        if media and post.status == TelegramContentStatus.NEW and not media_exists:
             type_, file_id, unique_id, file_name, file_size = media
             item = TelegramContentMedia(
                 content_post_id=post.id, source_message_id=message_id, type=type_,
                 telegram_file_id=file_id, file_unique_id=unique_id, file_name=file_name,
-                file_size=file_size, position=len(post.media),
+                file_size=file_size, position=media_count,
             )
             self.session.add(item)
-            post.media.append(item)
+            media_count += 1
         await self.session.flush()
-        return IngestResult(post, created)
+        return IngestResult(post, created, media_count)
 
     async def ignore(self, item_id: int, chat_id: int, actor: int) -> TelegramContentPost:
         post = await self._new_locked(item_id, chat_id)

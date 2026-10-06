@@ -11,7 +11,8 @@ from app.ai.service import AIService, ChannelContentPreparation
 from app.callbacks import ChannelPostCallback
 from app.database.models import TelegramContentMedia, TelegramContentPost
 from app.database.models.enums import MediaType, PageStatus, TelegramContentStatus
-from app.handlers.channel import OfficialGroupContentFilter, _ingest, supported_content
+from app.handlers.channel import ConfiguredGroupFilter, OfficialGroupContentFilter, _ingest, supported_content
+from app.bot import handle_update_error
 from app.services.channel_import import IngestResult, TelegramContentImportService, message_media, source_text, suggested_title
 from app.utils.presentation import html_text
 
@@ -51,6 +52,10 @@ class FakeRepository:
     async def by_group(self, chat_id, media_group_id, message_thread_id):
         return self.post if self.post and self.post.media_group_id == media_group_id and self.post.message_thread_id == message_thread_id else None
 
+    async def media_state(self, post_id, source_message_id):
+        items = self.post.__dict__.get("media", []) if self.post and self.post.id == post_id else []
+        return len(items), any(item.source_message_id == source_message_id for item in items)
+
 
 class ChannelIngestionTests(unittest.IsolatedAsyncioTestCase):
     async def test_text_post_is_persisted_without_ai(self):
@@ -61,6 +66,8 @@ class ChannelIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.created)
         self.assertEqual(result.post.status, TelegramContentStatus.NEW)
         self.assertEqual(source_text(result.post), "Приём в магистратуру")
+        self.assertEqual(result.media_count, 0)
+        self.assertIn(result.post, session.added)
         self.assertFalse(any("Gemini" in type(item).__name__ for item in session.added))
 
     async def test_duplicate_message_reuses_existing_post(self):
@@ -70,13 +77,15 @@ class ChannelIngestionTests(unittest.IsolatedAsyncioTestCase):
         result = await service.ingest(message(message_id=8, text="same"))  # type: ignore[arg-type]
         self.assertFalse(result.created)
         self.assertEqual(result.post.id, 4)
+        self.assertEqual(result.media_count, 0)
 
     async def test_edited_new_updates_but_processed_does_not(self):
         post = TelegramContentPost(id=4, chat_id=-1001, message_id=8, chat_type="supergroup", status=TelegramContentStatus.NEW, text="old", media=[])
         service = TelegramContentImportService(FakeSession())  # type: ignore[arg-type]
         service.repo = FakeRepository(post)  # type: ignore[assignment]
-        await service.ingest(message(message_id=8, text="new"), edited=True)  # type: ignore[arg-type]
+        result = await service.ingest(message(message_id=8, text="new"), edited=True)  # type: ignore[arg-type]
         self.assertEqual(post.text, "new")
+        self.assertEqual(result.media_count, 0)
         post.status = TelegramContentStatus.DRAFT_CREATED
         await service.ingest(message(message_id=8, text="must not replace"), edited=True)  # type: ignore[arg-type]
         self.assertEqual(post.text, "new")
@@ -89,7 +98,7 @@ class ChannelIngestionTests(unittest.IsolatedAsyncioTestCase):
         photo = [SimpleNamespace(file_id="b", file_unique_id="ub", file_size=100)]
         result = await service.ingest(message(message_id=11, group="album", thread=7, photo=photo))  # type: ignore[arg-type]
         self.assertFalse(result.created)
-        self.assertEqual(len(result.post.media), 2)
+        self.assertEqual(result.media_count, 2)
 
     async def test_same_album_id_in_different_topics_is_not_mixed(self):
         first = TelegramContentPost(id=5, chat_id=-1001, message_id=10, media_group_id="album", message_thread_id=7, chat_type="supergroup", status=TelegramContentStatus.NEW, media=[])
@@ -112,6 +121,19 @@ class ChannelIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document[0], MediaType.DOCUMENT)  # type: ignore[index]
         self.assertEqual(document[3], "a.pdf")  # type: ignore[index]
 
+    async def test_photo_and_document_ingestion_counts_one(self):
+        values = (
+            message(photo=[SimpleNamespace(file_id="p", file_unique_id="u", file_size=12)]),
+            message(document=SimpleNamespace(file_id="d", file_unique_id="du", file_name="a.pdf", file_size=42)),
+        )
+        for value in values:
+            session = FakeSession()
+            service = TelegramContentImportService(session)  # type: ignore[arg-type]
+            service.repo = FakeRepository()  # type: ignore[assignment]
+            result = await service.ingest(value)  # type: ignore[arg-type]
+            self.assertEqual(result.media_count, 1)
+            self.assertEqual(sum(isinstance(item, TelegramContentMedia) for item in session.added), 1)
+
     async def test_other_channel_is_ignored_server_side(self):
         settings = SimpleNamespace(content_chat_id=-1001)
         with patch("app.handlers.channel.TelegramContentImportService.ingest", new=AsyncMock()) as ingest:
@@ -119,11 +141,62 @@ class ChannelIngestionTests(unittest.IsolatedAsyncioTestCase):
             ingest.assert_not_awaited()
 
     async def test_configured_channel_calls_ingestion_once_and_no_ai(self):
-        post = TelegramContentPost(id=1, chat_id=-1001, message_id=1, chat_type="channel", status=TelegramContentStatus.NEW, text="x", media=[])
+        post = TelegramContentPost(id=1, chat_id=-1001, message_id=1, chat_type="channel", status=TelegramContentStatus.NEW, text="x")
         settings = SimpleNamespace(content_chat_id=-1001, content_channel_notify_admins=False)
-        with patch("app.handlers.channel.TelegramContentImportService.ingest", new=AsyncMock(return_value=IngestResult(post, True))) as ingest:
+        with patch("app.handlers.channel.TelegramContentImportService.ingest", new=AsyncMock(return_value=IngestResult(post, True, 0))) as ingest:
             await _ingest(message(text="channel post", chat_type=ChatType.CHANNEL), object(), settings, object(), edited=False)  # type: ignore[arg-type]
             ingest.assert_awaited_once()
+
+    async def test_live_group_flow_never_touches_lazy_media_and_notifies_after_ingest(self):
+        events = []
+
+        class GuardedPost:
+            id = 91
+            status = TelegramContentStatus.NEW
+            text = "Official group publication"
+            caption = None
+
+            @property
+            def media(self):
+                raise AssertionError("lazy relationship must not be accessed")
+
+        async def ingest(*args, **kwargs):
+            events.append("saved")
+            return IngestResult(GuardedPost(), True, 1)  # type: ignore[arg-type]
+
+        async def notify(*args, **kwargs):
+            events.append("notified")
+
+        settings = SimpleNamespace(content_chat_id=-1001, content_channel_notify_admins=True)
+        value = message(
+            text="Official group publication",
+            chat_type=ChatType.SUPERGROUP,
+            from_user=SimpleNamespace(id=7, is_bot=False),
+        )
+        bot = SimpleNamespace(get_chat_member=AsyncMock(return_value=SimpleNamespace(status=ChatMemberStatus.ADMINISTRATOR)))
+        self.assertTrue(await OfficialGroupContentFilter()(value, settings, bot))
+        with (
+            patch("app.handlers.channel.TelegramContentImportService.ingest", new=AsyncMock(side_effect=ingest)) as ingest_mock,
+            patch("app.handlers.channel._notify_admins", new=AsyncMock(side_effect=notify)) as notify_mock,
+            patch.object(AIService, "prepare_channel_content", new=AsyncMock()) as ai_mock,
+        ):
+            result = await _ingest(value, object(), settings, bot, edited=False)  # type: ignore[arg-type]
+        self.assertEqual(result.media_count, 1)  # type: ignore[union-attr]
+        self.assertEqual(events, ["saved", "notified"])
+        ingest_mock.assert_awaited_once()
+        notify_mock.assert_awaited_once()
+        ai_mock.assert_not_awaited()
+
+    async def test_edited_message_does_not_notify(self):
+        post = TelegramContentPost(id=1, chat_id=-1001, message_id=1, chat_type="supergroup", status=TelegramContentStatus.NEW, text="edited")
+        settings = SimpleNamespace(content_chat_id=-1001, content_channel_notify_admins=True)
+        with (
+            patch("app.handlers.channel.TelegramContentImportService.ingest", new=AsyncMock(return_value=IngestResult(post, False, 0))),
+            patch("app.handlers.channel._notify_admins", new=AsyncMock()) as notify,
+        ):
+            result = await _ingest(message(text="edited"), object(), settings, object(), edited=True)  # type: ignore[arg-type]
+        self.assertEqual(result.media_count, 0)  # type: ignore[union-attr]
+        notify.assert_not_awaited()
 
 
 class FakeProvider:
@@ -223,6 +296,43 @@ class GroupAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(get_chat_member=AsyncMock(side_effect=error))
         value = message(text="official", from_user=SimpleNamespace(id=7, is_bot=False), chat_type=ChatType.SUPERGROUP)
         self.assertFalse(await OfficialGroupContentFilter()(value, settings, bot))
+
+    async def test_configured_group_filter_isolated_from_private_and_other_groups(self):
+        settings = SimpleNamespace(content_chat_id=-1001)
+        content_group = message(channel=-1001, text="content", chat_type=ChatType.SUPERGROUP)
+        private = message(channel=-1001, text="private", chat_type=ChatType.PRIVATE)
+        other_group = message(channel=-2002, text="other", chat_type=ChatType.GROUP)
+        filter_ = ConfiguredGroupFilter()
+        self.assertTrue(await filter_(content_group, settings))
+        self.assertFalse(await filter_(private, settings))
+        self.assertFalse(await filter_(other_group, settings))
+
+
+class GlobalErrorHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_group_supergroup_and_channel_errors_only_log(self):
+        for chat_type, field in (
+            (ChatType.GROUP, "message"),
+            (ChatType.SUPERGROUP, "edited_message"),
+            (ChatType.CHANNEL, "channel_post"),
+        ):
+            origin = SimpleNamespace(chat=SimpleNamespace(type=chat_type), answer=AsyncMock())
+            values = {name: None for name in ("message", "edited_message", "channel_post", "edited_channel_post", "callback_query")}
+            values[field] = origin
+            event = SimpleNamespace(update=SimpleNamespace(**values), exception=RuntimeError("boom"))
+            logger = SimpleNamespace(exception=lambda *args, **kwargs: None)
+            self.assertTrue(await handle_update_error(event, logger))
+            origin.answer.assert_not_awaited()
+
+    async def test_private_error_keeps_user_message(self):
+        origin = SimpleNamespace(chat=SimpleNamespace(type=ChatType.PRIVATE), answer=AsyncMock())
+        update = SimpleNamespace(
+            message=origin, edited_message=None, channel_post=None,
+            edited_channel_post=None, callback_query=None,
+        )
+        event = SimpleNamespace(update=update, exception=RuntimeError("boom"))
+        logger = SimpleNamespace(exception=lambda *args, **kwargs: None)
+        self.assertTrue(await handle_update_error(event, logger))
+        origin.answer.assert_awaited_once()
 
 
 if __name__ == "__main__":

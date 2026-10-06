@@ -68,7 +68,7 @@ async def _ingest(message: Message, session: AsyncSession, settings: Settings, b
     if settings.content_chat_id is None or message.chat.id != settings.content_chat_id or not supported_content(message):
         return None
     result = await TelegramContentImportService(session).ingest(message, edited=edited)
-    logger.info("Telegram content received chat_id=%s message_id=%s thread_id=%s chat_type=%s media_count=%s status=%s edited=%s", message.chat.id, message.message_id, message.message_thread_id, message.chat.type, len(result.post.media), result.post.status.value, edited)
+    logger.info("Telegram content received chat_id=%s message_id=%s thread_id=%s chat_type=%s media_count=%s status=%s edited=%s", message.chat.id, message.message_id, message.message_thread_id, message.chat.type, result.media_count, result.post.status.value, edited)
     if result.created and not edited:
         await _notify_admins(bot, session, settings, result.post.id, suggested_title(source_text(result.post)))
     return result

@@ -44,6 +44,17 @@ class TelegramContentRepository:
             .limit(1)
         )
 
+    async def media_state(self, post_id: int, source_message_id: int) -> tuple[int, bool]:
+        row = (await self.session.execute(
+            select(
+                func.count(TelegramContentMedia.id),
+                func.count(TelegramContentMedia.id).filter(
+                    TelegramContentMedia.source_message_id == source_message_id
+                ),
+            ).where(TelegramContentMedia.content_post_id == post_id)
+        )).one()
+        return int(row[0]), bool(row[1])
+
     async def listing(self, chat_id: int, status: TelegramContentStatus, offset: int, limit: int) -> list[TelegramContentPost]:
         return list((await self.session.scalars(
             select(TelegramContentPost)
