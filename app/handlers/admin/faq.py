@@ -1,4 +1,5 @@
 import io
+import logging
 from datetime import date
 
 from aiogram import F, Router
@@ -22,6 +23,7 @@ from app.utils.presentation import html_text, text_preview
 from app.filters.admin import HasPermission
 
 router=Router(name="admin_faq"); SIZE=8
+logger = logging.getLogger(__name__)
 router.callback_query.filter(HasPermission(Permission.FAQ))
 router.message.filter(HasPermission(Permission.FAQ))
 IMPORT_KEYS=("import_rows","import_duplicates","import_errors","import_total","translation_faq_ids","ai_faq_translations","ai_edit_id","ai_edit_field","ai_edit_page")
@@ -30,6 +32,12 @@ async def ok(uid,s,c):return await PermissionService(s,c).has(uid,Permission.FAQ
 async def guard(cb,s,c):
     if await ok(cb.from_user.id,s,c):return True
     await cb.answer("Доступ запрещён",show_alert=True);return False
+
+async def sync_knowledge(session:AsyncSession,ai_service:AIService|None,reason:str)->None:
+    await session.commit()
+    if ai_service and ai_service.knowledge_index:
+        try:await ai_service.knowledge_index.sync_all(session)
+        except Exception as error:logger.warning("FAQ saved but knowledge index sync failed reason=%s error=%s",reason,type(error).__name__)
 
 async def listing(cb,session,page=0):
     items=await CMSRepository(session).faqs(); pages=max(1,(len(items)+SIZE-1)//SIZE);page=max(0,min(page,pages-1));chunk=items[page*SIZE:(page+1)*SIZE]
@@ -179,7 +187,7 @@ async def back_import_preview(cb:CallbackQuery,state:FSMContext)->None:await sho
 
 
 @router.callback_query(ImportFAQ.preview, FAQCallback.filter(F.action == "import_confirm"))
-async def confirm_import(cb: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
+async def confirm_import(cb: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext, ai_service: AIService | None) -> None:
     if not await guard(cb, session, settings): return
     data = await state.get_data(); raw_rows = data.get("import_rows", [])
     if not raw_rows: return await cb.answer("Нет новых строк для импорта", show_alert=True)
@@ -194,6 +202,7 @@ async def confirm_import(cb: CallbackQuery, session: AsyncSession, settings: Set
         item = await service.create(cb.from_user.id, row.question_ru, row.answer_ru, row.question_kk or None, row.answer_kk or None, is_active=row.is_active)
         await session.flush(); existing.add(normalized); added += 1
         if not row.question_kk: missing_ids.append(item.id)
+    await sync_knowledge(session, ai_service, "csv_import")
     await state.update_data(translation_faq_ids=missing_ids)
     await state.set_state(ImportFAQ.translation_preview if missing_ids else None)
     rows = []
@@ -302,7 +311,7 @@ async def ai_edit_back(cb:CallbackQuery,callback_data:FAQCallback,state:FSMConte
 
 
 @router.callback_query(ImportFAQ.translation_preview, FAQCallback.filter(F.action == "ai_save"))
-async def save_ai_faq(cb: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext) -> None:
+async def save_ai_faq(cb: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext, ai_service: AIService | None) -> None:
     if not await guard(cb, session, settings): return
     values = (await state.get_data()).get("ai_faq_translations", []); saved = skipped = 0
     for value in values:
@@ -310,6 +319,7 @@ async def save_ai_faq(cb: CallbackQuery, session: AsyncSession, settings: Settin
         if not item or any(translation.language_code == LanguageCode.KK for translation in item.translations):
             skipped += 1; continue
         await FAQService(session).update_translation(cb.from_user.id, item, LanguageCode.KK, question=value["question_kk"], answer=value["answer_kk"]); saved += 1
+    await sync_knowledge(session, ai_service, "ai_translation_save")
     await state.set_state(ImportFAQ.translation_preview)
     await safe_edit_text(cb.message,f"✅ <b>KK-переводы сохранены</b>\n\nСохранено: <b>{saved}</b>\nПропущено: <b>{skipped}</b>",reply_markup=kb([[InlineKeyboardButton(text="⬅️ FAQ",callback_data=FAQCallback(action="import_done").pack())]]));await cb.answer()
 
@@ -371,9 +381,9 @@ async def show_create_preview(bot,state):
     kk=(f"❓ Сұрақ:\n{html_text(d['faq_question_kk'])}\n\n💬 Жауап:\n{html_text(text_preview(d['faq_answer_kk']))}" if d.get('faq_question_kk') and d.get('faq_answer_kk') else "⚠️ Перевод отсутствует")
     await edit_wizard(bot,state,f"👁 <b>Предпросмотр FAQ</b>\n\n🇷🇺 <b>Русский</b>\n\n❓ Вопрос:\n{html_text(d['faq_question'])}\n\n💬 Ответ:\n{html_text(text_preview(d['faq_answer']))}\n\n🇰🇿 <b>Қазақша{' ⚠️' if not d.get('faq_question_kk') else ''}</b>\n\n{kk}\n\n🟢 Статус: Активен",kb([[InlineKeyboardButton(text="✏️ Изменить RU",callback_data=FAQCallback(action="create_edit_ru").pack()),InlineKeyboardButton(text="✏️ Изменить KK",callback_data=FAQCallback(action="create_kk_choice").pack())],[InlineKeyboardButton(text="✅ Создать FAQ",callback_data=FAQCallback(action="create").pack())],[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="create_cancel").pack())]]))
 @router.callback_query(AddFAQ.confirm,FAQCallback.filter(F.action=="create"))
-async def create(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext):
+async def create(cb:CallbackQuery,session:AsyncSession,settings:Settings,state:FSMContext,ai_service:AIService|None):
     if not await guard(cb,session,settings):return
-    d=await state.get_data();await FAQService(session).create(cb.from_user.id,d["faq_question"],d["faq_answer"],d.get("faq_question_kk"),d.get("faq_answer_kk"));await finish_wizard(state,"faq_question","faq_answer","faq_question_kk","faq_answer_kk");await listing(cb,session)
+    d=await state.get_data();await FAQService(session).create(cb.from_user.id,d["faq_question"],d["faq_answer"],d.get("faq_question_kk"),d.get("faq_answer_kk"));await sync_knowledge(session,ai_service,"create");await finish_wizard(state,"faq_question","faq_answer","faq_question_kk","faq_answer_kk");await listing(cb,session)
 
 @router.callback_query(FAQCallback.filter(F.action.in_({"create_back_q","create_back_a","create_kk_choice","create_skip_kk","create_edit_ru"})))
 async def create_navigation(cb:CallbackQuery,callback_data:FAQCallback,state:FSMContext):
@@ -390,16 +400,16 @@ async def cancel_create(cb:CallbackQuery,session:AsyncSession,settings:Settings,
     await finish_wizard(state,"faq_question","faq_answer","faq_question_kk","faq_answer_kk");await listing(cb,session)
 
 @router.callback_query(FAQCallback.filter(F.action.in_({"up","down","toggle","delete_ask","delete_yes"})))
-async def mutate(cb:CallbackQuery,callback_data:FAQCallback,session:AsyncSession,settings:Settings):
+async def mutate(cb:CallbackQuery,callback_data:FAQCallback,session:AsyncSession,settings:Settings,ai_service:AIService|None):
     if not await guard(cb,session,settings):return
     x=await CMSRepository(session).faq(callback_data.item_id)
     if not x:return await cb.answer("FAQ не найден",show_alert=True)
     svc=FAQService(session)
     if callback_data.action in {"up","down"}:await svc.move(cb.from_user.id,x,-1 if callback_data.action=="up" else 1);items=await CMSRepository(session).faqs();new_page=next((index//8 for index,item in enumerate(items) if item.id==x.id),callback_data.page);return await open_(cb,FAQCallback(action="open",item_id=x.id,page=new_page),session,settings)
-    if callback_data.action=="toggle":await svc.update(cb.from_user.id,x,is_active=not x.is_active);return await open_(cb,FAQCallback(action="open",item_id=x.id,page=callback_data.page),session,settings)
+    if callback_data.action=="toggle":await svc.update(cb.from_user.id,x,is_active=not x.is_active);await sync_knowledge(session,ai_service,"toggle");return await open_(cb,FAQCallback(action="open",item_id=x.id,page=callback_data.page),session,settings)
     if callback_data.action=="delete_ask":
         if cb.message:await safe_edit_text(cb.message,f"⚠️ <b>Удалить FAQ «{html_text(text_preview(x.question,60))}»?</b>\n\nЭто действие нельзя отменить.",reply_markup=kb([[InlineKeyboardButton(text="🔴 Да, удалить",callback_data=FAQCallback(action="delete_yes",item_id=x.id,page=callback_data.page).pack())],[InlineKeyboardButton(text="⬅️ Отмена",callback_data=FAQCallback(action="open",item_id=x.id,page=callback_data.page).pack())]]));return await cb.answer()
-    await svc.delete(cb.from_user.id,x);await listing(cb,session,callback_data.page)
+    await svc.delete(cb.from_user.id,x);await sync_knowledge(session,ai_service,"delete");await listing(cb,session,callback_data.page)
 
 @router.callback_query(FAQCallback.filter(F.action.in_({"edit_q","edit_a","edit_q_ru","edit_a_ru","edit_q_kk","edit_a_kk"})))
 async def edit(cb:CallbackQuery,callback_data:FAQCallback,session:AsyncSession,settings:Settings,state:FSMContext):
@@ -407,11 +417,11 @@ async def edit(cb:CallbackQuery,callback_data:FAQCallback,session:AsyncSession,s
         parts=callback_data.action.split("_");field="question" if parts[1]=="q" else "answer";language=parts[2] if len(parts)>2 else "ru";x=await CMSRepository(session).faq(callback_data.item_id);translation=next((v for v in x.translations if v.language_code==LanguageCode(language)),None) if x else None;current=(getattr(translation,field) if translation else getattr(x,field,""))
         await state.set_state(EditFAQ.value);await state.update_data(edit_faq_id=callback_data.item_id,edit_faq_field=field,edit_faq_language=language,edit_faq_page=callback_data.page);await remember_wizard(state,cb.message);await safe_edit_text(cb.message,f"✏️ <b>Редактирование FAQ</b>\n\n{'🇷🇺' if language=='ru' else '🇰🇿'} <b>{'Вопрос' if field=='question' else 'Ответ'}</b>\n\nТекущее значение:\n{html_text(text_preview(current,300))}\n\nОтправьте новое значение.",reply_markup=kb([[InlineKeyboardButton(text="❌ Отмена",callback_data=FAQCallback(action="edit_cancel",item_id=callback_data.item_id,page=callback_data.page).pack())]]));await cb.answer()
 @router.message(EditFAQ.value)
-async def edit_value(m:Message,session:AsyncSession,settings:Settings,state:FSMContext):
+async def edit_value(m:Message,session:AsyncSession,settings:Settings,state:FSMContext,ai_service:AIService|None):
     if not m.from_user or not await ok(m.from_user.id,session,settings):return
     d=await state.get_data();x=await CMSRepository(session).faq(d["edit_faq_id"])
     if x and m.text:
-        await FAQService(session).update_translation(m.from_user.id,x,LanguageCode(d["edit_faq_language"]),**{d["edit_faq_field"]:m.text});await session.flush();await consume_input(m);card,markup=faq_card(x,d.get("edit_faq_page",0));await edit_wizard(m.bot,state,card,markup);await finish_wizard(state,"edit_faq_id","edit_faq_field","edit_faq_language","edit_faq_page")
+        await FAQService(session).update_translation(m.from_user.id,x,LanguageCode(d["edit_faq_language"]),**{d["edit_faq_field"]:m.text});await sync_knowledge(session,ai_service,"edit");await consume_input(m);card,markup=faq_card(x,d.get("edit_faq_page",0));await edit_wizard(m.bot,state,card,markup);await finish_wizard(state,"edit_faq_id","edit_faq_field","edit_faq_language","edit_faq_page")
 
 @router.callback_query(EditFAQ.value,FAQCallback.filter(F.action=="edit_cancel"))
 async def edit_cancel(cb:CallbackQuery,callback_data:FAQCallback,session:AsyncSession,state:FSMContext)->None:

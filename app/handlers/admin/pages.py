@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -21,6 +23,7 @@ from app.utils.pagination import paginate
 from app.filters.admin import HasPermission
 
 router = Router(name="admin_pages")
+logger = logging.getLogger(__name__)
 router.callback_query.filter(HasPermission(Permission.CONTENT))
 router.message.filter(HasPermission(Permission.CONTENT))
 
@@ -516,19 +519,25 @@ async def preview(callback: CallbackQuery, callback_data: AdminPageCallback, ses
 
 
 @router.callback_query(AdminPageCallback.filter(F.action == "publish"))
-async def publish(callback: CallbackQuery, callback_data: AdminPageCallback, session: AsyncSession, settings: Settings) -> None:
+async def publish(callback: CallbackQuery, callback_data: AdminPageCallback, session: AsyncSession, settings: Settings, ai_service: AIService | None) -> None:
     if not await authorized(callback.from_user.id, session, settings):
         return await deny(callback)
     page = await PageRepository(session).by_id(callback_data.page_id)
     missing_kk = bool(page and page.draft_revision and not any(x.language_code == LanguageCode.KK for x in page.draft_revision.translations))
     await PageService(session).publish(callback_data.page_id, callback.from_user.id)
+    await session.commit()
+    if ai_service and ai_service.knowledge_index:
+        try:
+            await ai_service.knowledge_index.sync_all(session)
+        except Exception as error:
+            logger.warning("Page published but knowledge index sync failed page_id=%s error=%s", callback_data.page_id, type(error).__name__)
     if missing_kk and callback.message:
         await callback.message.answer("⚠️ Страница опубликована, но перевод KK отсутствует. Пользователям будет показан RU fallback.")
     await open_page(callback, AdminPageCallback(action="open", page_id=callback_data.page_id), session, settings)
 
 
 @router.callback_query(AdminPageCallback.filter(F.action.in_({"delete_ask", "delete_yes"})))
-async def delete_page(callback: CallbackQuery, callback_data: AdminPageCallback, session: AsyncSession, settings: Settings) -> None:
+async def delete_page(callback: CallbackQuery, callback_data: AdminPageCallback, session: AsyncSession, settings: Settings, ai_service: AIService | None) -> None:
     if not await authorized(callback.from_user.id, session, settings):
         return await deny(callback)
     page = await PageRepository(session).by_id(callback_data.page_id)
@@ -559,6 +568,12 @@ async def delete_page(callback: CallbackQuery, callback_data: AdminPageCallback,
         return await callback.answer()
     try:
         await PageService(session).delete(page.id, callback.from_user.id)
+        await session.commit()
+        if ai_service and ai_service.knowledge_index:
+            try:
+                await ai_service.knowledge_index.sync_all(session)
+            except Exception as index_error:
+                logger.warning("Page deleted but knowledge index sync failed page_id=%s error=%s", page.id, type(index_error).__name__)
     except ValueError as error:
         return await callback.answer(str(error), show_alert=True)
     await callback.answer("Страница удалена", show_alert=True)

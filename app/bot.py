@@ -14,6 +14,7 @@ from app.handlers.user import router as user_router
 from app.middlewares.database import DatabaseMiddleware
 from app.services.seed import seed
 from app.ai.knowledge import KnowledgeService
+from app.ai.index import KnowledgeIndexService
 from app.ai.provider import GeminiProvider
 from app.ai.service import AIService
 from app.utils.logging import configure_logging
@@ -34,16 +35,25 @@ async def main() -> None:
     dispatcher["session_factory"] = session_factory
     ai_service = None
     if settings.ai_available and settings.gemini_api_key:
-        provider = GeminiProvider(settings.gemini_api_key.get_secret_value(), settings.gemini_model, settings.ai_timeout_seconds)
+        provider = GeminiProvider(
+            settings.gemini_api_key.get_secret_value(), settings.gemini_model, settings.ai_timeout_seconds,
+            embedding_model=settings.ai_embedding_model,
+            embedding_dimension=settings.ai_embedding_dimension,
+        )
+        knowledge = KnowledgeService(
+            provider,
+            semantic_enabled=settings.ai_semantic_search_enabled,
+        )
         ai_service = AIService(
             provider,
             settings.ai_cooldown_seconds,
-            KnowledgeService(),
+            knowledge,
             provider_name=settings.ai_provider,
             model=settings.gemini_model,
             input_price_per_1m=settings.gemini_input_price_per_1m,
             output_price_per_1m=settings.gemini_output_price_per_1m,
         )
+        ai_service.knowledge_index = KnowledgeIndexService(provider, settings.ai_embedding_model)
         logger.info("AI assistant enabled provider=%s model=%s", settings.ai_provider, settings.gemini_model)
     elif settings.ai_enabled:
         logger.warning("AI assistant requested but configuration is incomplete; AI remains unavailable")

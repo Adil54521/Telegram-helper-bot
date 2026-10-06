@@ -6,6 +6,7 @@ from decimal import Decimal
 from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from pgvector.sqlalchemy import Vector
 
 from app.database.base import Base, TimestampMixin
 from app.database.models.enums import AdminRole, BroadcastStatus, ButtonAction, LanguageCode, MediaType, PageStatus
@@ -180,6 +181,34 @@ class AIUsage(Base):
 
     __table_args__ = (
         Index("ix_ai_usage_type_created", "request_type", "created_at"),
+    )
+
+
+class AIKnowledgeChunk(Base, TimestampMixin):
+    __tablename__ = "ai_knowledge_chunks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_type: Mapped[str] = mapped_column(String(16), index=True)
+    source_id: Mapped[int] = mapped_column(Integer, index=True)
+    revision_id: Mapped[int | None] = mapped_column(Integer)
+    language_code: Mapped[str] = mapped_column(String(8), index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(500))
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    embedding_model: Mapped[str] = mapped_column(String(128))
+    embedding: Mapped[list[float]] = mapped_column(Vector(768))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_type",
+            "source_id",
+            "revision_id",
+            "language_code",
+            "chunk_index",
+            name="uq_ai_knowledge_chunk_identity",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index("ix_ai_knowledge_chunk_source", "source_type", "source_id"),
     )
 
 

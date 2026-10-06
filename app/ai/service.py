@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.knowledge import KnowledgeService
+from app.ai.index import KnowledgeIndexService
 from app.ai.prompts import SYSTEM_PROMPT, build_input
 from app.ai.provider import AIProvider
 from app.database.repositories.ai_usage import AIUsageRepository
@@ -57,6 +58,7 @@ class AIService:
         self.input_price_per_1m = input_price_per_1m
         self.output_price_per_1m = output_price_per_1m
         self._last_requests: dict[int, float] = {}
+        self.knowledge_index: KnowledgeIndexService | None = None
 
     async def close(self) -> None:
         await self.provider.close()
@@ -152,12 +154,21 @@ class AIService:
         self._last_requests[user_id] = now
         started = time.monotonic()
         try:
-            items = await self.knowledge.search(session, question, language)
+            search_with_mode = getattr(self.knowledge, "search_with_mode", None)
+            if search_with_mode:
+                items, retrieval_mode = await search_with_mode(session, question, language)
+            else:
+                items = await self.knowledge.search(session, question, language)
+                retrieval_mode = "lexical"
         except Exception as error:
             duration_ms = int((time.monotonic() - started) * 1000)
             await self._record(session, user_id=user_id, request_type="USER", language=language, retrieval_count=0, gemini_called=False, input_tokens=0, output_tokens=0, total_tokens=0, cost=_zero_cost(), duration_ms=duration_ms, success=False, error_type=type(error).__name__)
             logger.exception("AI retrieval failed user_id=%s language=%s provider=%s model=%s gemini_called=false duration_ms=%d success=false error_type=%s", user_id, language, self.provider_name, self.model, duration_ms, type(error).__name__)
             raise
+        logger.info(
+            "AI retrieval completed mode=%s language=%s results=%d",
+            retrieval_mode, language, len(items),
+        )
         if not items:
             duration_ms = int((time.monotonic() - started) * 1000)
             await self._record(session, user_id=user_id, request_type="USER", language=language, retrieval_count=0, gemini_called=False, input_tokens=0, output_tokens=0, total_tokens=0, cost=_zero_cost(), duration_ms=duration_ms, success=True)

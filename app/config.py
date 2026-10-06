@@ -1,5 +1,6 @@
 from functools import lru_cache
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,6 +24,9 @@ class Settings(BaseSettings):
     ai_provider: str = "gemini"
     gemini_api_key: SecretStr | None = None
     gemini_model: str = ""
+    ai_semantic_search_enabled: bool = False
+    ai_embedding_model: str = "gemini-embedding-2"
+    ai_embedding_dimension: Literal[768] = 768
     ai_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     ai_cooldown_seconds: float = Field(default=8.0, ge=0, le=300)
     gemini_input_price_per_1m: Decimal = Field(default=Decimal("0.30"), ge=0)
