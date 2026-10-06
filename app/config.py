@@ -2,7 +2,7 @@ from functools import lru_cache
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,10 +27,24 @@ class Settings(BaseSettings):
     ai_semantic_search_enabled: bool = False
     ai_embedding_model: str = "gemini-embedding-2"
     ai_embedding_dimension: Literal[768] = 768
+    content_chat_id: int | None = None
+    content_channel_id: int | None = None
+    content_channel_notify_admins: bool = True
     ai_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     ai_cooldown_seconds: float = Field(default=8.0, ge=0, le=300)
     gemini_input_price_per_1m: Decimal = Field(default=Decimal("0.30"), ge=0)
     gemini_output_price_per_1m: Decimal = Field(default=Decimal("2.50"), ge=0)
+
+    @field_validator("content_chat_id", "content_channel_id", mode="before")
+    @classmethod
+    def empty_channel_id(cls, value: object) -> object:
+        return None if value == "" else value
+
+    @model_validator(mode="after")
+    def legacy_content_chat_fallback(self) -> "Settings":
+        if self.content_chat_id is None:
+            self.content_chat_id = self.content_channel_id
+        return self
 
     @property
     def database_url(self) -> str:

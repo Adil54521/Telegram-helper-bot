@@ -2,7 +2,7 @@ import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Sequence
+from typing import Literal, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -42,6 +42,19 @@ class PageTranslation(BaseModel):
 
 class ShortTranslation(BaseModel):
     text_kk: str = Field(min_length=1, max_length=1024)
+
+
+class ChannelContentPreparation(BaseModel):
+    recommended_type: Literal["PAGE", "FAQ", "IGNORE"]
+    reason_short: str = Field(min_length=1, max_length=300)
+    title_ru: str | None = Field(default=None, max_length=255)
+    text_ru: str | None = Field(default=None, max_length=20_000)
+    title_kk: str | None = Field(default=None, max_length=255)
+    text_kk: str | None = Field(default=None, max_length=20_000)
+    question_ru: str | None = Field(default=None, max_length=500)
+    answer_ru: str | None = Field(default=None, max_length=10_000)
+    question_kk: str | None = Field(default=None, max_length=500)
+    answer_kk: str | None = Field(default=None, max_length=10_000)
 
 
 def _zero_cost() -> AICost:
@@ -236,3 +249,55 @@ class AIService:
         result = await self._structured_translation(session, user_id=user_id, request_type=request_type, user_input=text, schema=ShortTranslation, max_output_tokens=min(256, max(32, len(text) * 2)))
         value = result if isinstance(result, ShortTranslation) else ShortTranslation.model_validate(result)
         return value.text_kk.strip()
+
+    async def prepare_channel_content(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: int,
+        source: str,
+        media_summary: str = "",
+    ) -> ChannelContentPreparation:
+        if not source.strip():
+            raise ValueError("Channel post has no text")
+        truncated = source[:12_000]
+        payload = __import__("json").dumps(
+            {"post": truncated, "media": media_summary[:1000], "input_truncated": len(source) > len(truncated)},
+            ensure_ascii=False,
+        )
+        instructions = (
+            "Transform one official KUAM Telegram post into CMS content. Use only facts in the post; "
+            "never invent dates, prices, contacts or requirements. Preserve names, numbers, URLs and codes. "
+            "Choose PAGE for durable reference information, FAQ only when naturally question/answer, otherwise IGNORE. "
+            "For PAGE fill title_ru/text_ru/title_kk/text_kk. For FAQ fill question_ru/answer_ru/question_kk/answer_kk. "
+            "Translate naturally from Russian to Kazakh without adding information. Return the structured schema only."
+        )
+        started = time.monotonic()
+        try:
+            parsed, usage = await self.provider.generate_structured(
+                instructions=instructions,
+                user_input=payload,
+                response_schema=ChannelContentPreparation,
+                max_output_tokens=1800,
+            )
+        except Exception as error:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            await self._record(
+                session, user_id=user_id, request_type="CHANNEL_CONTENT_PREPARATION", language="ru",
+                retrieval_count=0, gemini_called=True, input_tokens=0, output_tokens=0, total_tokens=0,
+                cost=_zero_cost(), duration_ms=duration_ms, success=False, error_type=type(error).__name__,
+            )
+            raise
+        value = parsed if isinstance(parsed, ChannelContentPreparation) else ChannelContentPreparation.model_validate(parsed)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        cost = calculate_cost(usage.input_tokens, usage.output_tokens, self.input_price_per_1m, self.output_price_per_1m)
+        await self._record(
+            session, user_id=user_id, request_type="CHANNEL_CONTENT_PREPARATION", language="ru",
+            retrieval_count=0, gemini_called=True, input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens, cost=cost, duration_ms=duration_ms, success=True,
+        )
+        logger.info(
+            "Channel content preparation user_id=%s provider=%s model=%s input_tokens=%d output_tokens=%d duration_ms=%d success=true",
+            user_id, self.provider_name, self.model, usage.input_tokens, usage.output_tokens, duration_ms,
+        )
+        return value

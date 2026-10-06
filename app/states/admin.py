@@ -77,3 +77,8 @@ class EditAttachment(StatesGroup):
 
 class TestAIRetrieval(StatesGroup):
     query = State()
+
+
+class ModerateChannelPost(StatesGroup):
+    preview = State()
+    edit = State()

@@ -11,6 +11,7 @@ from app.config import get_settings
 from app.database.session import create_session_factory
 from app.handlers.admin import router as admin_router
 from app.handlers.user import router as user_router
+from app.handlers.channel import router as channel_router
 from app.middlewares.database import DatabaseMiddleware
 from app.services.seed import seed
 from app.ai.knowledge import KnowledgeService
@@ -60,7 +61,7 @@ async def main() -> None:
     dispatcher["ai_service"] = ai_service
     database = DatabaseMiddleware(session_factory)
     dispatcher.update.outer_middleware(database)
-    dispatcher.include_routers(admin_router(), user_router())
+    dispatcher.include_routers(channel_router, admin_router(), user_router())
 
     @dispatcher.error()
     async def error_handler(event: ErrorEvent) -> bool:

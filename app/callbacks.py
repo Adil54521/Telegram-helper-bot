@@ -76,3 +76,10 @@ class AttachmentCallback(CallbackData, prefix="att"):
     page_id: int = 0
     language: str = ""
     page: int = 0
+
+
+class ChannelPostCallback(CallbackData, prefix="ch"):
+    action: str
+    item_id: int = 0
+    page: int = 0
+    status: str = "NEW"

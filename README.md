@@ -70,6 +70,21 @@ AI v2 добавляет семантический индекс PostgreSQL/pgve
 
 Если кнопка AI не появляется, проверьте `AI_ENABLED`, непустые `GEMINI_API_KEY` и `GEMINI_MODEL`, затем изучите `docker-compose logs bot`. При ошибках API пользователь получает безопасное локализованное сообщение; ключ и полный запрос в логи не записываются.
 
+## Импорт официальных Telegram-публикаций
+
+Единая интеграция принимает новые публикации из настроенного Telegram channel, group или supergroup. Identity проверяется только по numeric chat ID; username, название группы и название forum topic не являются security identifiers. Поддерживаются `channel_post`, `edited_channel_post`, сообщения администраторов группы, anonymous admin posts от имени самой группы, albums и Forum Topics. Bot API не используется для чтения старой истории.
+
+```env
+CONTENT_CHAT_ID=-1001234567890
+CONTENT_CHANNEL_NOTIFY_ADMINS=true
+```
+
+При пустом `CONTENT_CHAT_ID` интеграция выключена и не мешает запуску. Старый `CONTENT_CHANNEL_ID` временно поддерживается как deprecated fallback, но новые установки должны использовать `CONTENT_CHAT_ID`. Новые text/photo/document posts и части media groups сохраняются в PostgreSQL без скачивания файлов, Gemini и embeddings. `message_thread_id` сохраняется для forum topics, но темы пока не фильтруются. Модерация доступна в `/admin → Telegram-публикации`: администратор может вручную подготовить Page/FAQ, явно вызвать одно structured Gemini-преобразование или исключить публикацию. Page всегда создаётся как DRAFT и публикуется обычным CMS workflow.
+
+Для group/supergroup бот проверяет отправителя через `getChatMember` и принимает только administrator/creator либо корректный anonymous admin post, где `sender_chat.id == chat.id`. Для этой проверки бот должен быть администратором группы; дополнительные права удаления сообщений, блокировки участников, публикации историй и т. п. не требуются.
+
+По официальной документации Telegram bot-admin получает все сообщения группы. Если бот не назначен администратором, отключите Privacy Mode через `@BotFather → /setprivacy → Disable` и повторно добавьте бота в группу; иначе обычные сообщения могут не приходить. Настройка privacy mode программно невозможна.
+
 ## Первый запуск
 
 ```bash

@@ -12,6 +12,7 @@ def dashboard(role: AdminRole) -> InlineKeyboardMarkup:
     definitions = [
         (Permission.CONTENT, "📄 Страницы", "pages"),
         (Permission.CONTENT, "🔘 Меню и кнопки", "buttons"),
+        (Permission.CONTENT, "📥 Telegram-публикации", "channel_posts"),
         (Permission.FAQ, "❓ FAQ", "faq"),
         (Permission.BROADCAST, "📢 Рассылка", "broadcasts"),
         (Permission.ADMINS, "👥 Администраторы", "admins"),

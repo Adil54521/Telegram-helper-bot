@@ -39,3 +39,9 @@ class BroadcastStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class TelegramContentStatus(StrEnum):
+    NEW = "NEW"
+    DRAFT_CREATED = "DRAFT_CREATED"
+    IGNORED = "IGNORED"

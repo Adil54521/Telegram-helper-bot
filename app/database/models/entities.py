@@ -9,7 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 
 from app.database.base import Base, TimestampMixin
-from app.database.models.enums import AdminRole, BroadcastStatus, ButtonAction, LanguageCode, MediaType, PageStatus
+from app.database.models.enums import AdminRole, BroadcastStatus, ButtonAction, LanguageCode, MediaType, PageStatus, TelegramContentStatus
 
 
 class TelegramUser(Base):
@@ -225,3 +225,54 @@ class Broadcast(Base):
     total: Mapped[int] = mapped_column(Integer, default=0)
     sent: Mapped[int] = mapped_column(Integer, default=0)
     failed: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class TelegramContentPost(Base, TimestampMixin):
+    __tablename__ = "telegram_content_posts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    media_group_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    message_thread_id: Mapped[int | None] = mapped_column(Integer)
+    chat_type: Mapped[str] = mapped_column(String(16))
+    chat_title: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[TelegramContentStatus] = mapped_column(
+        Enum(TelegramContentStatus, name="telegram_content_status"),
+        default=TelegramContentStatus.NEW,
+        index=True,
+    )
+    text: Mapped[str | None] = mapped_column(Text)
+    caption: Mapped[str | None] = mapped_column(Text)
+    telegram_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processed_by: Mapped[int | None] = mapped_column(BigInteger)
+    created_page_id: Mapped[int | None] = mapped_column(ForeignKey("bot_pages.id", ondelete="SET NULL"))
+    created_faq_id: Mapped[int | None] = mapped_column(ForeignKey("faq_items.id", ondelete="SET NULL"))
+    media: Mapped[list["TelegramContentMedia"]] = relationship(
+        back_populates="post", cascade="all, delete-orphan", lazy="selectin",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("chat_id", "message_id", name="uq_telegram_content_post_message"),
+        Index("ix_telegram_content_posts_status_created", "status", "created_at"),
+        Index("ix_telegram_content_posts_group", "chat_id", "media_group_id", "message_thread_id"),
+    )
+
+
+class TelegramContentMedia(Base):
+    __tablename__ = "telegram_content_media"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    content_post_id: Mapped[int] = mapped_column(ForeignKey("telegram_content_posts.id", ondelete="CASCADE"), index=True)
+    source_message_id: Mapped[int] = mapped_column(Integer)
+    type: Mapped[MediaType] = mapped_column(Enum(MediaType, name="telegram_content_media_type"))
+    telegram_file_id: Mapped[str] = mapped_column(String(512))
+    file_unique_id: Mapped[str | None] = mapped_column(String(512))
+    file_name: Mapped[str | None] = mapped_column(String(255))
+    file_size: Mapped[int | None] = mapped_column(BigInteger)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    post: Mapped[TelegramContentPost] = relationship(back_populates="media")
+
+    __table_args__ = (
+        UniqueConstraint("content_post_id", "source_message_id", name="uq_telegram_content_media_message"),
+    )
