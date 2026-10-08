@@ -1,10 +1,11 @@
 import re
 
-from sqlalchemy import select
+from sqlalchemy import String, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from app.database.models import AuditLog, BotPage, BotPageRevision, BotPageRevisionTranslation, PageAttachment
-from app.database.models.enums import LanguageCode, PageStatus
+from app.database.models import AIKnowledgeSyncJob, AuditLog, BotButton, BotPage, BotPageRevision, BotPageRevisionTranslation, PageAttachment, TelegramAutoDraftLink, TelegramContentPost, TelegramTopicPageMapping
+from app.database.models.enums import ButtonAction, LanguageCode, PageStatus
 from app.database.repositories.pages import PageRepository
 
 
@@ -91,6 +92,10 @@ class PageService:
                     caption_kk=value.caption_kk,
                     position=value.position,
                     is_active=value.is_active,
+                    telegram_source_post_id=value.telegram_source_post_id,
+                    telegram_source_chat_id=value.telegram_source_chat_id,
+                    telegram_source_message_id=value.telegram_source_message_id,
+                    telegram_source_file_unique_id=value.telegram_source_file_unique_id,
                 )
             )
 
@@ -142,7 +147,7 @@ class PageService:
         for translation in page.draft_revision.translations:
             self.session.add(BotPageRevisionTranslation(revision_id=revision.id, language_code=translation.language_code, title=title if translation.language_code == LanguageCode.RU and title is not None else translation.title, text=text if translation.language_code == LanguageCode.RU and text is not None else translation.text))
         for attachment in page.draft_revision.attachments:
-            self.session.add(PageAttachment(revision_id=revision.id, type=attachment.type, telegram_file_id=attachment.telegram_file_id, file_name=attachment.file_name, caption_ru=attachment.caption_ru, caption_kk=attachment.caption_kk, position=attachment.position, is_active=attachment.is_active))
+            self.session.add(PageAttachment(revision_id=revision.id, type=attachment.type, telegram_file_id=attachment.telegram_file_id, file_name=attachment.file_name, caption_ru=attachment.caption_ru, caption_kk=attachment.caption_kk, position=attachment.position, is_active=attachment.is_active, telegram_source_post_id=attachment.telegram_source_post_id, telegram_source_chat_id=attachment.telegram_source_chat_id, telegram_source_message_id=attachment.telegram_source_message_id, telegram_source_file_unique_id=attachment.telegram_source_file_unique_id))
         page.draft_revision_id = revision.id
         page.updated_by = admin_id
         self.session.add(AuditLog(admin_id=admin_id, action="PAGE_UPDATED", entity_type="BotPage", entity_id=str(page.id), old_data=old, new_data={"title": revision.title, "text": revision.text}))
@@ -221,7 +226,7 @@ class PageService:
         await self.session.flush()
 
     async def publish(self, page_id: int, admin_id: int) -> None:
-        page = await self.repo.by_id(page_id)
+        page = await self.repo.by_id(page_id, lock=True)
         if not page or not page.draft_revision_id:
             raise ValueError("Page not found")
         old_id = page.published_revision_id
@@ -229,3 +234,143 @@ class PageService:
         page.status = PageStatus.PUBLISHED
         page.updated_by = admin_id
         self.session.add(AuditLog(admin_id=admin_id, action="PAGE_PUBLISHED", entity_type="BotPage", entity_id=str(page.id), old_data={"revision_id": old_id}, new_data={"revision_id": page.draft_revision_id}))
+        await self._activate_auto_draft_link(page, admin_id)
+        await self._queue_knowledge_sync(page, admin_id)
+
+    async def _queue_knowledge_sync(self, page: BotPage, admin_id: int) -> None:
+        if not page.published_revision_id:
+            return
+        job = await self.session.scalar(
+            select(AIKnowledgeSyncJob).where(AIKnowledgeSyncJob.page_id == page.id).with_for_update()
+        )
+        if job is None:
+            job = AIKnowledgeSyncJob(page_id=page.id, revision_id=page.published_revision_id)
+            self.session.add(job)
+        else:
+            job.revision_id = page.published_revision_id
+            job.status = "PENDING"
+            job.attempts = 0
+            job.last_error = None
+        self.session.add(AuditLog(
+            admin_id=admin_id,
+            action="AI_KNOWLEDGE_SYNC_QUEUED",
+            entity_type="BotPage",
+            entity_id=str(page.id),
+            new_data={"revision_id": page.published_revision_id},
+        ))
+
+    async def _activate_auto_draft_link(self, page: BotPage, admin_id: int) -> None:
+        link = await self._resolve_auto_draft_link(page)
+        if not link or not link.parent_page_id or page.status != PageStatus.PUBLISHED:
+            return
+        parent = await self.session.get(BotPage, link.parent_page_id)
+        if not parent or not parent.is_active or parent.status != PageStatus.PUBLISHED:
+            raise ValueError("Родительская страница автчерновика больше недоступна")
+        revision = await self.session.scalar(
+            select(BotPageRevision)
+            .where(BotPageRevision.id == page.published_revision_id)
+            .options(selectinload(BotPageRevision.translations))
+            .execution_options(populate_existing=True)
+        )
+        if not revision:
+            raise ValueError("Опубликованная ревизия дочерней страницы не найдена")
+        translations = {item.language_code: item for item in revision.translations}
+        ru = translations.get(LanguageCode.RU)
+        kk = translations.get(LanguageCode.KK)
+        title_ru = ru.title if ru else revision.title
+        title_kk = kk.title if kk else None
+
+        button = None
+        if link.button_id:
+            button = await self.session.scalar(
+                select(BotButton).where(BotButton.id == link.button_id).options(selectinload(BotButton.translations))
+            )
+            if button and not (
+                button.page_id == parent.id
+                and button.action_type == ButtonAction.PAGE
+                and button.target == page.key
+            ):
+                button = None
+                link.button_id = None
+        if button is None:
+            button = await self.session.scalar(select(BotButton).where(
+                BotButton.page_id == parent.id,
+                BotButton.action_type == ButtonAction.PAGE,
+                BotButton.target == page.key,
+            ).options(selectinload(BotButton.translations)).limit(1))
+        from app.services.cms import ButtonService
+        button_service = ButtonService(self.session)
+        if button:
+            link.button_id = button.id
+            if not button.is_active:
+                await button_service.update(admin_id, button, is_active=True)
+            existing = {item.language_code: item for item in button.translations}
+            if not existing.get(LanguageCode.RU) or existing[LanguageCode.RU].text != title_ru:
+                await button_service.update_translation(admin_id, button, LanguageCode.RU, title_ru)
+            if title_kk and (not existing.get(LanguageCode.KK) or existing[LanguageCode.KK].text != title_kk):
+                await button_service.update_translation(admin_id, button, LanguageCode.KK, title_kk)
+            return
+        button = await button_service.create(
+            admin_id, parent.id, title_ru, ButtonAction.PAGE, page.key, title_kk,
+        )
+        link.button_id = button.id
+        self.session.add(AuditLog(
+            admin_id=admin_id, action="TELEGRAM_AUTO_DRAFT_LINK_ACTIVATED",
+            entity_type="BotButton", entity_id=str(button.id),
+            new_data={"parent_page_id": parent.id, "child_page_id": page.id},
+        ))
+
+    async def _resolve_auto_draft_link(self, page: BotPage) -> TelegramAutoDraftLink | None:
+        link = await self.session.scalar(
+            select(TelegramAutoDraftLink)
+            .where(TelegramAutoDraftLink.child_page_id == page.id)
+            .with_for_update()
+        )
+        if link:
+            return link
+        audit = await self.session.scalar(
+            select(AuditLog).where(
+                AuditLog.action == "TELEGRAM_AUTO_DRAFT_CREATED",
+                AuditLog.entity_type == "BotPage",
+                AuditLog.entity_id == str(page.id),
+            ).order_by(AuditLog.id.desc()).limit(1)
+        )
+        data = audit.new_data if audit and isinstance(audit.new_data, dict) else {}
+        parent_page_id = data.get("parent_page_id")
+        source_post_id = data.get("source_post_id")
+        if not isinstance(parent_page_id, int) or not isinstance(source_post_id, int):
+            return None
+        source = await self.session.get(TelegramContentPost, source_post_id)
+        if not source or source.created_page_id != page.id:
+            return None
+        mapping = await self.session.scalar(select(TelegramTopicPageMapping).where(
+            TelegramTopicPageMapping.chat_id == source.chat_id,
+            TelegramTopicPageMapping.message_thread_id == source.message_thread_id,
+            TelegramTopicPageMapping.parent_page_id == parent_page_id,
+        ).limit(1))
+        link = TelegramAutoDraftLink(
+            source_post_id=source_post_id, child_page_id=page.id,
+            parent_page_id=parent_page_id, mapping_id=mapping.id if mapping else None,
+        )
+        self.session.add(link)
+        await self.session.flush()
+        return link
+
+    async def repair_published_auto_draft_buttons(self, admin_id: int, limit: int = 100) -> int:
+        pages = list((await self.session.scalars(
+            select(BotPage)
+            .join(AuditLog, (AuditLog.entity_type == "BotPage") & (AuditLog.entity_id == BotPage.id.cast(String)))
+            .where(AuditLog.action == "TELEGRAM_AUTO_DRAFT_CREATED", BotPage.status == PageStatus.PUBLISHED)
+            .options(selectinload(BotPage.published_revision), selectinload(BotPage.draft_revision))
+            .order_by(BotPage.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )).unique().all())
+        repaired = 0
+        for page in pages:
+            before = await self.session.scalar(select(TelegramAutoDraftLink.button_id).where(TelegramAutoDraftLink.child_page_id == page.id))
+            await self._activate_auto_draft_link(page, admin_id)
+            after = await self.session.scalar(select(TelegramAutoDraftLink.button_id).where(TelegramAutoDraftLink.child_page_id == page.id))
+            if not before and after:
+                repaired += 1
+        return repaired

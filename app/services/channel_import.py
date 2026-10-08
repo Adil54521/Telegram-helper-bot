@@ -9,6 +9,7 @@ from app.database.models.enums import LanguageCode, MediaType, TelegramContentSt
 from app.database.repositories.channel_posts import TelegramContentRepository
 from app.services.cms import FAQService
 from app.services.pages import PageService
+from app.services.telegram_publication_grouper import SelectedPublicationMaterial, TelegramPublicationGrouper
 
 MAX_TRANSFER_DOCUMENT_SIZE = 20 * 1024 * 1024
 
@@ -44,13 +45,15 @@ class TelegramContentImportService:
         self.session = session
         self.repo = TelegramContentRepository(session)
 
-    async def ingest(self, message: Message, *, edited: bool = False) -> IngestResult:
+    async def ingest(self, message: Message, *, edited: bool = False) -> IngestResult | None:
         chat_id, message_id = message.chat.id, message.message_id
         thread_id = getattr(message, "message_thread_id", None)
         post = await self.repo.by_source(chat_id, message_id)
         if not post and message.media_group_id:
             post = await self.repo.by_group(chat_id, message.media_group_id, thread_id)
         created = post is None
+        if post is None and edited:
+            return None
         if post is None:
             post = TelegramContentPost(
                 chat_id=chat_id,
@@ -108,8 +111,28 @@ class TelegramContentImportService:
     async def create_page(
         self, item_id: int, chat_id: int, actor: int, *,
         title_ru: str, text_ru: str, title_kk: str | None = None, text_kk: str | None = None,
+        materials: tuple[SelectedPublicationMaterial, ...] = (),
     ):
         post = await self._new_locked(item_id, chat_id)
+        selected_posts: list[TelegramContentPost] = []
+        if materials:
+            selected_ids = [material.content_post_id for material in materials]
+            if len(selected_ids) != len(set(selected_ids)):
+                raise ValueError("Материалы выбраны повторно")
+            allowed = await TelegramPublicationGrouper(self.repo).group(post)
+            allowed_ids = {candidate.content_post_id for candidate in allowed.materials}
+            if not set(selected_ids).issubset(allowed_ids):
+                raise ValueError("Список материалов устарел. Откройте подбор заново")
+            selected_posts = await self.repo.by_ids_for_update(selected_ids, chat_id)
+            if len(selected_posts) != len(selected_ids):
+                raise ValueError("Один из материалов больше недоступен")
+            selected_by_id = {candidate.id: candidate for candidate in selected_posts}
+            selected_posts = [selected_by_id[item_id] for item_id in selected_ids]
+            for candidate in selected_posts:
+                if candidate.status != TelegramContentStatus.NEW:
+                    raise ValueError("Один из материалов уже использован")
+                if candidate.message_thread_id != post.message_thread_id or candidate.message_id <= post.message_id:
+                    raise ValueError("Материал не относится к этой публикации")
         page = await PageService(self.session).create(title_ru, text_ru, actor)
         await self.session.flush()
         if title_kk and text_kk:
@@ -117,18 +140,46 @@ class TelegramContentImportService:
         revision_id = page.draft_revision_id
         if not revision_id:
             raise RuntimeError("Draft revision was not created")
+        attachment_position = 0
         for media in post.media:
             if media.type == MediaType.DOCUMENT and media.file_size and media.file_size > MAX_TRANSFER_DOCUMENT_SIZE:
                 continue
             self.session.add(PageAttachment(
                 revision_id=revision_id, type=media.type, telegram_file_id=media.telegram_file_id,
-                file_name=media.file_name, position=media.position, is_active=True,
+                file_name=media.file_name, position=attachment_position, is_active=True,
+                telegram_source_post_id=post.id, telegram_source_chat_id=post.chat_id,
+                telegram_source_message_id=media.source_message_id,
+                telegram_source_file_unique_id=media.file_unique_id,
             ))
+            attachment_position += 1
+        for candidate in selected_posts:
+            for media in candidate.media:
+                if media.type == MediaType.DOCUMENT and media.file_size and media.file_size > MAX_TRANSFER_DOCUMENT_SIZE:
+                    continue
+                self.session.add(PageAttachment(
+                    revision_id=revision_id,
+                    type=media.type,
+                    telegram_file_id=media.telegram_file_id,
+                    file_name=media.file_name,
+                    position=attachment_position,
+                    is_active=True,
+                    telegram_source_post_id=candidate.id,
+                    telegram_source_chat_id=candidate.chat_id,
+                    telegram_source_message_id=media.source_message_id,
+                    telegram_source_file_unique_id=media.file_unique_id,
+                ))
+                attachment_position += 1
         post.status = TelegramContentStatus.DRAFT_CREATED
         post.created_page_id = page.id
         post.processed_by = actor
         post.processed_at = datetime.now(timezone.utc)
         self._audit(actor, "CHANNEL_POST_PAGE_CREATED", post, {"page_id": page.id})
+        for candidate in selected_posts:
+            candidate.status = TelegramContentStatus.DRAFT_CREATED
+            candidate.created_page_id = page.id
+            candidate.processed_by = actor
+            candidate.processed_at = datetime.now(timezone.utc)
+            self._audit(actor, "CHANNEL_MATERIAL_USED", candidate, {"page_id": page.id, "source_post_id": post.id})
         return page
 
     async def create_faq(

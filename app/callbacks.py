@@ -83,3 +83,4 @@ class ChannelPostCallback(CallbackData, prefix="ch"):
     item_id: int = 0
     page: int = 0
     status: str = "NEW"
+    thread_id: int = 0

@@ -45,3 +45,21 @@ class TelegramContentStatus(StrEnum):
     NEW = "NEW"
     DRAFT_CREATED = "DRAFT_CREATED"
     IGNORED = "IGNORED"
+
+
+class TelegramProcessingMode(StrEnum):
+    MANUAL = "MANUAL"
+    AUTO_DRAFT = "AUTO_DRAFT"
+    AUTO_PUBLISH = "AUTO_PUBLISH"
+
+
+class TelegramEditSyncMode(StrEnum):
+    OFF = "OFF"
+    REVIEW = "REVIEW"
+    AUTO = "AUTO"
+
+
+class TelegramFileSyncMode(StrEnum):
+    OFF = "OFF"
+    REVIEW = "REVIEW"
+    AUTO = "AUTO"

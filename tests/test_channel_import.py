@@ -11,7 +11,7 @@ from app.ai.service import AIService, ChannelContentPreparation
 from app.callbacks import ChannelPostCallback
 from app.database.models import TelegramContentMedia, TelegramContentPost
 from app.database.models.enums import MediaType, PageStatus, TelegramContentStatus
-from app.handlers.channel import ConfiguredGroupFilter, OfficialGroupContentFilter, _ingest, supported_content
+from app.handlers.channel import ConfiguredGroupFilter, OfficialGroupContentFilter, _ingest, _notify_admins, supported_content
 from app.bot import handle_update_error
 from app.services.channel_import import IngestResult, TelegramContentImportService, message_media, source_text, suggested_title
 from app.utils.presentation import html_text
@@ -55,6 +55,29 @@ class FakeRepository:
     async def media_state(self, post_id, source_message_id):
         items = self.post.__dict__.get("media", []) if self.post and self.post.id == post_id else []
         return len(items), any(item.source_message_id == source_message_id for item in items)
+
+
+class TelegramImportNotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cms_off_suppresses_new_publication_notification(self):
+        settings = SimpleNamespace(content_chat_id=-1001, content_channel_notify_admins=True, super_admin_id=42)
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with patch(
+            "app.handlers.channel.TelegramAutoDraftRepository.notifications_enabled",
+            new=AsyncMock(return_value=False),
+        ):
+            await _notify_admins(bot, object(), settings, 7, "Publication")  # type: ignore[arg-type]
+        bot.send_message.assert_not_awaited()
+
+    async def test_cms_on_sends_even_when_legacy_env_default_is_off(self):
+        settings = SimpleNamespace(content_chat_id=-1001, content_channel_notify_admins=False, super_admin_id=42)
+        bot = SimpleNamespace(send_message=AsyncMock())
+        session = SimpleNamespace(scalars=AsyncMock(return_value=SimpleNamespace(all=lambda: [])))
+        with patch(
+            "app.handlers.channel.TelegramAutoDraftRepository.notifications_enabled",
+            new=AsyncMock(return_value=True),
+        ):
+            await _notify_admins(bot, session, settings, 7, "Publication")  # type: ignore[arg-type]
+        bot.send_message.assert_awaited_once()
 
 
 class ChannelIngestionTests(unittest.IsolatedAsyncioTestCase):
@@ -143,7 +166,7 @@ class ChannelIngestionTests(unittest.IsolatedAsyncioTestCase):
     async def test_configured_channel_calls_ingestion_once_and_no_ai(self):
         post = TelegramContentPost(id=1, chat_id=-1001, message_id=1, chat_type="channel", status=TelegramContentStatus.NEW, text="x")
         settings = SimpleNamespace(content_chat_id=-1001, content_channel_notify_admins=False)
-        with patch("app.handlers.channel.TelegramContentImportService.ingest", new=AsyncMock(return_value=IngestResult(post, True, 0))) as ingest:
+        with patch("app.handlers.channel.TelegramContentImportService.ingest", new=AsyncMock(return_value=IngestResult(post, True, 0))) as ingest, patch("app.handlers.channel._notify_admins", new=AsyncMock()):
             await _ingest(message(text="channel post", chat_type=ChatType.CHANNEL), object(), settings, object(), edited=False)  # type: ignore[arg-type]
             ingest.assert_awaited_once()
 

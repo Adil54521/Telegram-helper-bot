@@ -10,7 +10,7 @@ from app.ai.knowledge import MAX_CONTEXT_CHARS, MAX_RESULTS, KnowledgeService
 from app.ai.service import AIService, MAX_QUESTION_LENGTH
 from app.callbacks import AdminAICallback, AdminMenuCallback
 from app.config import Settings
-from app.database.models import AIKnowledgeChunk, AuditLog, BotPage, FAQItem
+from app.database.models import AIKnowledgeChunk, AIKnowledgeSyncJob, AuditLog, BotPage, FAQItem
 from app.database.models.enums import PageStatus
 from app.database.repositories.users import upsert_user
 from app.services.ai_analytics import AIAnalyticsPeriod, AIAnalyticsService
@@ -284,6 +284,8 @@ async def knowledge_index(
     ru = await session.scalar(select(func.count(AIKnowledgeChunk.id)).where(AIKnowledgeChunk.language_code == "ru")) or 0
     kk = await session.scalar(select(func.count(AIKnowledgeChunk.id)).where(AIKnowledgeChunk.language_code == "kk")) or 0
     last_sync = await session.scalar(select(func.max(AIKnowledgeChunk.updated_at)))
+    pending_jobs = await session.scalar(select(func.count(AIKnowledgeSyncJob.id)).where(AIKnowledgeSyncJob.status.in_(("PENDING", "RUNNING")))) or 0
+    failed_jobs = await session.scalar(select(func.count(AIKnowledgeSyncJob.id)).where(AIKnowledgeSyncJob.status == "FAILED")) or 0
     preview = None
     if callback_data.action == "index_preview" and ai_service and ai_service.knowledge_index:
         preview = await ai_service.knowledge_index.preview(session)
@@ -293,7 +295,8 @@ async def knowledge_index(
         f"Модель: {html_text(settings.ai_embedding_model)}\n"
         f"Размерность: {settings.ai_embedding_dimension}\n\n"
         f"Всего чанков: {chunks}\n🇷🇺 RU: {ru}\n🇰🇿 KK: {kk}\n"
-        f"Последняя синхронизация: {last_sync.strftime('%Y-%m-%d %H:%M UTC') if last_sync else '—'}"
+        f"Последняя синхронизация: {last_sync.strftime('%Y-%m-%d %H:%M UTC') if last_sync else '—'}\n"
+        f"⏳ Ожидают индексации: {pending_jobs}\n⚠️ Ошибок индексации: {failed_jobs}"
     )
     if preview:
         text += (

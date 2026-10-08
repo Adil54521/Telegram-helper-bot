@@ -14,6 +14,7 @@ from app.handlers.user import router as user_router
 from app.handlers.channel import router as channel_router
 from app.middlewares.database import DatabaseMiddleware
 from app.services.seed import seed
+from app.services.telegram_auto_drafts import run_auto_draft_processor
 from app.ai.knowledge import KnowledgeService
 from app.ai.index import KnowledgeIndexService
 from app.ai.provider import GeminiProvider
@@ -87,9 +88,16 @@ async def main() -> None:
         return await handle_update_error(event, logger)
 
     logger.info("Bot polling started")
+    auto_stop = asyncio.Event()
+    auto_task = asyncio.create_task(run_auto_draft_processor(
+        bot, session_factory, settings, auto_stop,
+        ai_service.knowledge_index if ai_service else None,
+    ))
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
+        auto_stop.set()
+        await auto_task
         if ai_service:
             await ai_service.close()
         await bot.session.close()

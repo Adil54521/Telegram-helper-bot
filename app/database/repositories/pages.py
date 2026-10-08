@@ -16,10 +16,13 @@ class PageRepository:
         )
         return result.scalar_one_or_none()
 
-    async def by_id(self, page_id: int) -> BotPage | None:
-        result = await self.session.execute(
-            select(BotPage).where(BotPage.id == page_id).options(selectinload(BotPage.published_revision), selectinload(BotPage.draft_revision))
+    async def by_id(self, page_id: int, *, lock: bool = False) -> BotPage | None:
+        query = select(BotPage).where(BotPage.id == page_id).options(
+            selectinload(BotPage.published_revision), selectinload(BotPage.draft_revision)
         )
+        if lock:
+            query = query.with_for_update()
+        result = await self.session.execute(query)
         return result.scalar_one_or_none()
 
     async def all(self) -> list[BotPage]:

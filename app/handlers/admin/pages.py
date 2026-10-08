@@ -526,11 +526,6 @@ async def publish(callback: CallbackQuery, callback_data: AdminPageCallback, ses
     missing_kk = bool(page and page.draft_revision and not any(x.language_code == LanguageCode.KK for x in page.draft_revision.translations))
     await PageService(session).publish(callback_data.page_id, callback.from_user.id)
     await session.commit()
-    if ai_service and ai_service.knowledge_index:
-        try:
-            await ai_service.knowledge_index.sync_all(session)
-        except Exception as error:
-            logger.warning("Page published but knowledge index sync failed page_id=%s error=%s", callback_data.page_id, type(error).__name__)
     if missing_kk and callback.message:
         await callback.message.answer("⚠️ Страница опубликована, но перевод KK отсутствует. Пользователям будет показан RU fallback.")
     await open_page(callback, AdminPageCallback(action="open", page_id=callback_data.page_id), session, settings)

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 
 from app.database.base import Base, TimestampMixin
-from app.database.models.enums import AdminRole, BroadcastStatus, ButtonAction, LanguageCode, MediaType, PageStatus, TelegramContentStatus
+from app.database.models.enums import AdminRole, BroadcastStatus, ButtonAction, LanguageCode, MediaType, PageStatus, TelegramContentStatus, TelegramEditSyncMode, TelegramFileSyncMode, TelegramProcessingMode
 
 
 class TelegramUser(Base):
@@ -88,6 +88,10 @@ class PageAttachment(Base, TimestampMixin):
     caption_kk: Mapped[str | None] = mapped_column(String(1024))
     position: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    telegram_source_post_id: Mapped[int | None] = mapped_column(ForeignKey("telegram_content_posts.id", ondelete="SET NULL"), index=True)
+    telegram_source_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    telegram_source_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    telegram_source_file_unique_id: Mapped[str | None] = mapped_column(String(255))
     revision: Mapped[BotPageRevision] = relationship(back_populates="attachments")
 
 
@@ -248,6 +252,9 @@ class TelegramContentPost(Base, TimestampMixin):
     processed_by: Mapped[int | None] = mapped_column(BigInteger)
     created_page_id: Mapped[int | None] = mapped_column(ForeignKey("bot_pages.id", ondelete="SET NULL"))
     created_faq_id: Mapped[int | None] = mapped_column(ForeignKey("faq_items.id", ondelete="SET NULL"))
+    auto_process_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    auto_processing_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    auto_last_error: Mapped[str | None] = mapped_column(String(255))
     media: Mapped[list["TelegramContentMedia"]] = relationship(
         back_populates="post", cascade="all, delete-orphan", lazy="selectin",
     )
@@ -276,3 +283,110 @@ class TelegramContentMedia(Base):
     __table_args__ = (
         UniqueConstraint("content_post_id", "source_message_id", name="uq_telegram_content_media_message"),
     )
+
+
+class TelegramImportSettings(Base, TimestampMixin):
+    __tablename__ = "telegram_import_settings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    auto_draft_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    auto_draft_enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    settle_seconds: Mapped[int] = mapped_column(Integer, default=60, server_default="60", nullable=False)
+    notify_admins: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+
+
+class TelegramForumTopic(Base, TimestampMixin):
+    __tablename__ = "telegram_forum_topics"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_thread_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    topic_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    __table_args__ = (UniqueConstraint("chat_id", "message_thread_id", name="uq_telegram_forum_topic"),)
+
+
+class TelegramTopicPageMapping(Base, TimestampMixin):
+    __tablename__ = "telegram_topic_page_mappings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_thread_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    parent_page_id: Mapped[int] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), nullable=False, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    auto_draft_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    processing_mode: Mapped[TelegramProcessingMode] = mapped_column(
+        Enum(TelegramProcessingMode, name="telegram_processing_mode"),
+        default=TelegramProcessingMode.AUTO_DRAFT,
+        server_default=TelegramProcessingMode.AUTO_DRAFT.value,
+        nullable=False,
+    )
+    processing_mode_enabled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    edit_sync_mode: Mapped[TelegramEditSyncMode] = mapped_column(
+        Enum(TelegramEditSyncMode, name="telegram_edit_sync_mode"),
+        default=TelegramEditSyncMode.OFF,
+        server_default=TelegramEditSyncMode.OFF.value,
+        nullable=False,
+    )
+    file_sync_mode: Mapped[TelegramFileSyncMode] = mapped_column(
+        Enum(TelegramFileSyncMode, name="telegram_file_sync_mode"),
+        default=TelegramFileSyncMode.OFF,
+        server_default=TelegramFileSyncMode.OFF.value,
+        nullable=False,
+    )
+    auto_attach_materials: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    created_by: Mapped[int | None] = mapped_column(BigInteger)
+    updated_by: Mapped[int | None] = mapped_column(BigInteger)
+    __table_args__ = (UniqueConstraint("chat_id", "message_thread_id", name="uq_telegram_topic_page_mapping"),)
+
+
+class TelegramAutoDraftLink(Base):
+    __tablename__ = "telegram_auto_draft_links"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_post_id: Mapped[int] = mapped_column(ForeignKey("telegram_content_posts.id", ondelete="CASCADE"), unique=True, nullable=False)
+    child_page_id: Mapped[int] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), unique=True, nullable=False)
+    parent_page_id: Mapped[int | None] = mapped_column(ForeignKey("bot_pages.id", ondelete="SET NULL"), index=True)
+    mapping_id: Mapped[int | None] = mapped_column(ForeignKey("telegram_topic_page_mappings.id", ondelete="SET NULL"))
+    button_id: Mapped[int | None] = mapped_column(ForeignKey("bot_buttons.id", ondelete="SET NULL"), unique=True)
+    last_synced_revision_id: Mapped[int | None] = mapped_column(ForeignKey("bot_page_revisions.id", ondelete="SET NULL"))
+    source_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TelegramEditPending(Base, TimestampMixin):
+    __tablename__ = "telegram_edit_pending"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_post_id: Mapped[int] = mapped_column(ForeignKey("telegram_content_posts.id", ondelete="CASCADE"), unique=True, nullable=False)
+    page_id: Mapped[int] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), nullable=False, index=True)
+    base_revision_id: Mapped[int | None] = mapped_column(ForeignKey("bot_page_revisions.id", ondelete="SET NULL"))
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    title_ru: Mapped[str | None] = mapped_column(String(255))
+    text_ru: Mapped[str | None] = mapped_column(Text)
+    title_kk: Mapped[str | None] = mapped_column(String(255))
+    text_kk: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default="REVIEW", server_default="REVIEW", nullable=False)
+    conflict_reason: Mapped[str | None] = mapped_column(String(255))
+
+
+class AIKnowledgeSyncJob(Base, TimestampMixin):
+    __tablename__ = "ai_knowledge_sync_jobs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    page_id: Mapped[int] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), unique=True, nullable=False)
+    revision_id: Mapped[int] = mapped_column(ForeignKey("bot_page_revisions.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", server_default="PENDING", nullable=False, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    last_error: Mapped[str | None] = mapped_column(String(255))
+
+
+class TelegramAttachmentReplacement(Base, TimestampMixin):
+    __tablename__ = "telegram_attachment_replacements"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_post_id: Mapped[int] = mapped_column(ForeignKey("telegram_content_posts.id", ondelete="CASCADE"), unique=True, nullable=False)
+    page_id: Mapped[int] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), nullable=False, index=True)
+    attachment_id: Mapped[int | None] = mapped_column(ForeignKey("page_attachments.id", ondelete="SET NULL"))
+    base_revision_id: Mapped[int | None] = mapped_column(ForeignKey("bot_page_revisions.id", ondelete="SET NULL"))
+    media_type: Mapped[MediaType] = mapped_column(Enum(MediaType, name="attachment_type", create_type=False), nullable=False)
+    new_file_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    new_file_unique_id: Mapped[str | None] = mapped_column(String(255))
+    new_file_name: Mapped[str | None] = mapped_column(String(255))
+    source_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="REVIEW", server_default="REVIEW", nullable=False)
+    conflict_reason: Mapped[str | None] = mapped_column(String(255))

@@ -55,6 +55,50 @@ class TelegramContentRepository:
         )).one()
         return int(row[0]), bool(row[1])
 
+    async def media_count(self, post_id: int) -> int:
+        return int(await self.session.scalar(
+            select(func.count(TelegramContentMedia.id)).where(
+                TelegramContentMedia.content_post_id == post_id,
+            )
+        ) or 0)
+
+    async def following_posts(
+        self,
+        chat_id: int,
+        message_thread_id: int | None,
+        after_message_id: int,
+        limit: int,
+    ) -> list[TelegramContentPost]:
+        thread_filter = (
+            TelegramContentPost.message_thread_id.is_(None)
+            if message_thread_id is None
+            else TelegramContentPost.message_thread_id == message_thread_id
+        )
+        return list((await self.session.scalars(
+            select(TelegramContentPost)
+            .where(
+                TelegramContentPost.chat_id == chat_id,
+                thread_filter,
+                TelegramContentPost.message_id > after_message_id,
+                TelegramContentPost.status == TelegramContentStatus.NEW,
+            )
+            .options(self._loaded())
+            .order_by(TelegramContentPost.message_id.asc())
+            .limit(limit)
+        )).all())
+
+    async def by_ids_for_update(self, item_ids: list[int], chat_id: int) -> list[TelegramContentPost]:
+        if not item_ids:
+            return []
+        return list((await self.session.scalars(
+            select(TelegramContentPost)
+            .where(TelegramContentPost.id.in_(item_ids), TelegramContentPost.chat_id == chat_id)
+            .options(self._loaded())
+            .order_by(TelegramContentPost.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).all())
+
     async def listing(self, chat_id: int, status: TelegramContentStatus, offset: int, limit: int) -> list[TelegramContentPost]:
         return list((await self.session.scalars(
             select(TelegramContentPost)

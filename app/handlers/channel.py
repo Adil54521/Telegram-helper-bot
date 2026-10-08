@@ -1,6 +1,6 @@
 import logging
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import BaseFilter
@@ -11,8 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.callbacks import ChannelPostCallback
 from app.config import Settings
 from app.database.models import Admin
+from app.database.repositories.telegram_auto_drafts import TelegramAutoDraftRepository
 from app.services.channel_import import IngestResult, TelegramContentImportService, message_media, source_text, suggested_title
 from app.services.permissions import Permission, ROLE_PERMISSIONS
+from app.services.telegram_auto_drafts import TelegramAutoDraftService, processing_mode
+from app.database.models.enums import TelegramProcessingMode
+from app.services.telegram_edit_sync import TelegramEditSyncService
+from app.services.telegram_attachment_sync import TelegramAttachmentSyncService
 from app.utils.presentation import html_text, text_preview
 
 logger = logging.getLogger(__name__)
@@ -50,8 +55,22 @@ class OfficialGroupContentFilter(ConfiguredGroupFilter):
         return allowed
 
 
+@router.message(ConfiguredGroupFilter(), F.forum_topic_created | F.forum_topic_edited)
+async def capture_forum_topic_metadata(message: Message, session: AsyncSession) -> None:
+    thread_id = message.message_thread_id
+    event = message.forum_topic_created or message.forum_topic_edited
+    topic_name = (getattr(event, "name", None) or "").strip()
+    if thread_id is None or not topic_name:
+        return
+    await TelegramAutoDraftRepository(session).upsert_topic_name(message.chat.id, thread_id, topic_name[:255])
+    logger.info("Telegram forum topic metadata updated chat_id=%s thread_id=%s", message.chat.id, thread_id)
+
+
 async def _notify_admins(bot: Bot, session: AsyncSession, settings: Settings, item_id: int, title: str) -> None:
-    if not settings.content_channel_notify_admins:
+    if settings.content_chat_id is None or not await TelegramAutoDraftRepository(session).notifications_enabled(
+        settings.content_chat_id,
+        settings.content_channel_notify_admins,
+    ):
         return
     admins = list((await session.scalars(select(Admin).where(Admin.is_active.is_(True)))).all())
     recipients = {admin.telegram_id for admin in admins if Permission.CONTENT in ROLE_PERMISSIONS.get(admin.role, set())}
@@ -64,13 +83,88 @@ async def _notify_admins(bot: Bot, session: AsyncSession, settings: Settings, it
             logger.warning("Telegram content notification failed admin_id=%s error=%s", telegram_id, type(error).__name__)
 
 
+async def _notify_edit_review(bot: Bot, session: AsyncSession, settings: Settings, pending_id: int, status: str) -> None:
+    if settings.content_chat_id is None or not await TelegramAutoDraftRepository(session).notifications_enabled(
+        settings.content_chat_id, settings.content_channel_notify_admins,
+    ):
+        return
+    admins = list((await session.scalars(select(Admin).where(Admin.is_active.is_(True)))).all())
+    recipients = {admin.telegram_id for admin in admins if Permission.CONTENT in ROLE_PERMISSIONS.get(admin.role, set())}
+    recipients.add(settings.super_admin_id)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Проверить изменение", callback_data=ChannelPostCallback(action="edit_open", item_id=pending_id).pack())]
+    ])
+    for telegram_id in recipients:
+        try:
+            await bot.send_message(
+                telegram_id,
+                "⚠️ <b>Изменение Telegram-публикации требует проверки</b>\n\n"
+                f"Статус: {html_text(status)}",
+                reply_markup=markup,
+            )
+        except TelegramAPIError as error:
+            logger.warning("Telegram edit review notification failed admin_id=%s error=%s", telegram_id, type(error).__name__)
+
+
+async def _notify_attachment_review(bot: Bot, session: AsyncSession, settings: Settings, pending_id: int, status: str) -> None:
+    if settings.content_chat_id is None or not await TelegramAutoDraftRepository(session).notifications_enabled(
+        settings.content_chat_id, settings.content_channel_notify_admins,
+    ):
+        return
+    admins = list((await session.scalars(select(Admin).where(Admin.is_active.is_(True)))).all())
+    recipients = {admin.telegram_id for admin in admins if Permission.CONTENT in ROLE_PERMISSIONS.get(admin.role, set())}
+    recipients.add(settings.super_admin_id)
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="👁 Проверить замену", callback_data=ChannelPostCallback(action="file_open", item_id=pending_id).pack())
+    ]])
+    for telegram_id in recipients:
+        try:
+            await bot.send_message(
+                telegram_id,
+                "📎 <b>Изменение Telegram-материала</b>\n\n"
+                f"Статус: {html_text(status)}",
+                reply_markup=markup,
+            )
+        except TelegramAPIError as error:
+            logger.warning("Telegram attachment review notification failed admin_id=%s error=%s", telegram_id, type(error).__name__)
+
+
+async def _should_notify_new_post(session: AsyncSession, post) -> bool:
+    if post.message_thread_id is None:
+        return True
+    mapping = await TelegramAutoDraftRepository(session).mapping(post.chat_id, post.message_thread_id)
+    return not mapping or not mapping.is_active or processing_mode(mapping) == TelegramProcessingMode.MANUAL
+
+
 async def _ingest(message: Message, session: AsyncSession, settings: Settings, bot: Bot, *, edited: bool) -> IngestResult | None:
     if settings.content_chat_id is None or message.chat.id != settings.content_chat_id or not supported_content(message):
         return None
     result = await TelegramContentImportService(session).ingest(message, edited=edited)
+    if result is None:
+        logger.debug("Unknown edited Telegram message ignored chat_id=%s message_id=%s", message.chat.id, message.message_id)
+        return None
+    if isinstance(session, AsyncSession):
+        if edited and result.post.status.value != "NEW":
+            file_result = await TelegramAttachmentSyncService(session, settings.super_admin_id).process_edit(
+                result.post.id, message_media(message), message.message_id,
+            )
+            if file_result.pending_id:
+                await _notify_attachment_review(bot, session, settings, file_result.pending_id, file_result.status)
+            edit_result = await TelegramEditSyncService(session, settings.super_admin_id).process(
+                result.post.id,
+                (message.text or message.caption or "").strip(),
+            )
+            if edit_result.pending_id:
+                await _notify_edit_review(bot, session, settings, edit_result.pending_id, edit_result.status)
+        else:
+            await TelegramAutoDraftService(session, settings.content_chat_id, settings.super_admin_id).schedule(result.post, result.media_count)
     logger.info("Telegram content received chat_id=%s message_id=%s thread_id=%s chat_type=%s media_count=%s status=%s edited=%s", message.chat.id, message.message_id, message.message_thread_id, message.chat.type, result.media_count, result.post.status.value, edited)
     if result.created and not edited:
-        await _notify_admins(bot, session, settings, result.post.id, suggested_title(source_text(result.post)))
+        should_notify = True
+        if isinstance(session, AsyncSession):
+            should_notify = await _should_notify_new_post(session, result.post)
+        if should_notify:
+            await _notify_admins(bot, session, settings, result.post.id, suggested_title(source_text(result.post)))
     return result
 
 
