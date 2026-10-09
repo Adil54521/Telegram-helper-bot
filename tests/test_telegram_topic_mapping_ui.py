@@ -2,12 +2,16 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from aiogram import Dispatcher
+from aiogram.enums import ChatType
+
+from app.bot import polling_allowed_updates
 from app.callbacks import ChannelPostCallback
 from app.database.models import BotButton, BotPage, BotPageRevision, TelegramTopicPageMapping
 from app.database.repositories.telegram_auto_drafts import TopicMappingListItem
 from app.database.models.enums import PageStatus, TelegramProcessingMode
 from app.handlers.admin.channel_posts import mapping_confirm, mapping_create, mapping_select_page, render_mappings, topic_label
-from app.handlers.channel import capture_forum_topic_metadata, supported_content
+from app.handlers.channel import capture_forum_topic_metadata, router as channel_router, supported_content
 
 
 class TelegramTopicMappingCallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -117,13 +121,20 @@ class TelegramTopicMappingCallbackTests(unittest.IsolatedAsyncioTestCase):
 
 class ForumTopicMetadataTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def message(*, thread_id: int, created: str | None = None, edited: str | None = None):
+    def message(
+        *,
+        thread_id: int | None,
+        created: str | None = None,
+        edited: str | None = None,
+        chat_type: ChatType = ChatType.SUPERGROUP,
+    ):
         return SimpleNamespace(
-            chat=SimpleNamespace(id=-100123),
+            chat=SimpleNamespace(id=-100123, type=chat_type),
             message_thread_id=thread_id,
             forum_topic_created=SimpleNamespace(name=created) if created is not None else None,
             forum_topic_edited=SimpleNamespace(name=edited) if edited is not None else None,
             text=None, caption=None, photo=None, document=None,
+            answer=AsyncMock(),
         )
 
     async def test_created_and_edited_events_upsert_same_stable_identity(self):
@@ -137,6 +148,43 @@ class ForumTopicMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repo.upsert_topic_name.await_args_list[1].args, (-100123, 2, "Практика и трудоустройство"))
         mapping = TelegramTopicPageMapping(chat_id=-100123, message_thread_id=2, parent_page_id=17)
         self.assertEqual((mapping.chat_id, mapping.message_thread_id, mapping.parent_page_id), (-100123, 2, 17))
+        created.answer.assert_not_awaited()
+        edited.answer.assert_not_awaited()
+
+    async def test_repeat_event_is_idempotent_at_repository_boundary(self):
+        repo = SimpleNamespace(upsert_topic_name=AsyncMock())
+        message = self.message(thread_id=30, created="Новости")
+        with patch("app.handlers.channel.TelegramAutoDraftRepository", return_value=repo):
+            await capture_forum_topic_metadata(message, object())  # type: ignore[arg-type]
+            await capture_forum_topic_metadata(message, object())  # type: ignore[arg-type]
+        self.assertEqual(repo.upsert_topic_name.await_count, 2)
+        self.assertEqual(repo.upsert_topic_name.await_args.args, (-100123, 30, "Новости"))
+        message.answer.assert_not_awaited()
+
+    async def test_general_topic_without_thread_and_non_supergroup_are_ignored(self):
+        repo = SimpleNamespace(upsert_topic_name=AsyncMock())
+        with patch("app.handlers.channel.TelegramAutoDraftRepository", return_value=repo):
+            await capture_forum_topic_metadata(
+                self.message(thread_id=None, created="General"), object(),  # type: ignore[arg-type]
+            )
+            await capture_forum_topic_metadata(
+                self.message(thread_id=2, created="Практика", chat_type=ChatType.GROUP), object(),  # type: ignore[arg-type]
+            )
+        repo.upsert_topic_name.assert_not_awaited()
 
     def test_forum_service_event_is_not_supported_publication_content(self):
         self.assertFalse(supported_content(self.message(thread_id=2, created="Практика")))
+
+    def test_topic_handler_precedes_configured_group_catch_all(self):
+        callbacks = [handler.callback.__name__ for handler in channel_router.observers["message"].handlers]
+        self.assertLess(
+            callbacks.index("capture_forum_topic_metadata"),
+            callbacks.index("ignore_configured_group_noise"),
+        )
+
+    def test_polling_requests_message_updates_without_fake_topic_update(self):
+        dispatcher = Dispatcher()
+        updates = polling_allowed_updates(dispatcher)
+        self.assertIn("message", updates)
+        self.assertNotIn("forum_topic_created", updates)
+        self.assertNotIn("forum_topic_edited", updates)

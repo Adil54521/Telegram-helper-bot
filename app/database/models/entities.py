@@ -9,7 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 
 from app.database.base import Base, TimestampMixin
-from app.database.models.enums import AdminRole, BroadcastStatus, ButtonAction, LanguageCode, MediaType, PageStatus, TelegramContentStatus, TelegramEditSyncMode, TelegramFileSyncMode, TelegramProcessingMode
+from app.database.models.enums import AdminRole, BroadcastStatus, ButtonAction, LanguageCode, MediaType, PageStatus, TelegramContentStatus, TelegramContentTarget, TelegramEditSyncMode, TelegramFileSyncMode, TelegramProcessingMode
 
 
 class TelegramUser(Base):
@@ -126,6 +126,7 @@ class FAQItem(Base, TimestampMixin):
     answer: Mapped[str] = mapped_column(Text)
     position: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    current_revision_id: Mapped[int | None] = mapped_column(ForeignKey("faq_revisions.id", ondelete="SET NULL"), nullable=True, index=True)
     translations: Mapped[list["FAQItemTranslation"]] = relationship(back_populates="faq", cascade="all, delete-orphan", lazy="selectin")
 
 
@@ -138,6 +139,23 @@ class FAQItemTranslation(Base):
     answer: Mapped[str] = mapped_column(Text)
     faq: Mapped[FAQItem] = relationship(back_populates="translations")
     __table_args__ = (UniqueConstraint("faq_id", "language_code", name="uq_faq_language"),)
+
+
+class FAQRevision(Base):
+    __tablename__ = "faq_revisions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    faq_id: Mapped[int] = mapped_column(ForeignKey("faq_items.id", ondelete="CASCADE"), index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_ru: Mapped[str] = mapped_column(String(500))
+    answer_ru: Mapped[str] = mapped_column(Text)
+    question_kk: Mapped[str | None] = mapped_column(String(500))
+    answer_kk: Mapped[str | None] = mapped_column(Text)
+    source_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_post_id: Mapped[int | None] = mapped_column(ForeignKey("telegram_content_posts.id", ondelete="SET NULL"), index=True)
+    content_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    __table_args__ = (UniqueConstraint("faq_id", "version", name="uq_faq_revision_version"),)
 
 
 class AuditLog(Base):
@@ -309,7 +327,13 @@ class TelegramTopicPageMapping(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     message_thread_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    parent_page_id: Mapped[int] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), nullable=False, index=True)
+    parent_page_id: Mapped[int | None] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), nullable=True, index=True)
+    content_target: Mapped[TelegramContentTarget] = mapped_column(
+        Enum(TelegramContentTarget, name="telegram_content_target"),
+        default=TelegramContentTarget.PAGE,
+        server_default=TelegramContentTarget.PAGE.value,
+        nullable=False,
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     auto_draft_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     processing_mode: Mapped[TelegramProcessingMode] = mapped_column(
@@ -365,11 +389,40 @@ class TelegramEditPending(Base, TimestampMixin):
     conflict_reason: Mapped[str | None] = mapped_column(String(255))
 
 
+class TelegramFAQSyncLink(Base):
+    __tablename__ = "telegram_faq_sync_links"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_post_id: Mapped[int] = mapped_column(ForeignKey("telegram_content_posts.id", ondelete="CASCADE"), unique=True, nullable=False)
+    faq_id: Mapped[int] = mapped_column(ForeignKey("faq_items.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
+    last_synced_revision_id: Mapped[int | None] = mapped_column(ForeignKey("faq_revisions.id", ondelete="SET NULL"))
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_edit_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class TelegramFAQEditPending(Base, TimestampMixin):
+    __tablename__ = "telegram_faq_edit_pending"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_post_id: Mapped[int] = mapped_column(ForeignKey("telegram_content_posts.id", ondelete="CASCADE"), unique=True, nullable=False)
+    faq_id: Mapped[int] = mapped_column(ForeignKey("faq_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    base_revision_id: Mapped[int | None] = mapped_column(ForeignKey("faq_revisions.id", ondelete="SET NULL"))
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    question_ru: Mapped[str | None] = mapped_column(String(500))
+    answer_ru: Mapped[str | None] = mapped_column(Text)
+    question_kk: Mapped[str | None] = mapped_column(String(500))
+    answer_kk: Mapped[str | None] = mapped_column(Text)
+    source_edit_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(24), default="REVIEW", server_default="REVIEW", nullable=False)
+    conflict_reason: Mapped[str | None] = mapped_column(String(255))
+
+
 class AIKnowledgeSyncJob(Base, TimestampMixin):
     __tablename__ = "ai_knowledge_sync_jobs"
     id: Mapped[int] = mapped_column(primary_key=True)
-    page_id: Mapped[int] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), unique=True, nullable=False)
-    revision_id: Mapped[int] = mapped_column(ForeignKey("bot_page_revisions.id", ondelete="CASCADE"), nullable=False)
+    page_id: Mapped[int | None] = mapped_column(ForeignKey("bot_pages.id", ondelete="CASCADE"), unique=True, nullable=True)
+    faq_id: Mapped[int | None] = mapped_column(ForeignKey("faq_items.id", ondelete="CASCADE"), unique=True, nullable=True)
+    revision_id: Mapped[int | None] = mapped_column(ForeignKey("bot_page_revisions.id", ondelete="CASCADE"), nullable=True)
+    faq_revision_id: Mapped[int | None] = mapped_column(ForeignKey("faq_revisions.id", ondelete="CASCADE"), nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="PENDING", server_default="PENDING", nullable=False, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)

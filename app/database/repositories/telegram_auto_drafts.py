@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database.models import BotPage, BotPageRevision, TelegramContentPost, TelegramForumTopic, TelegramImportSettings, TelegramTopicPageMapping
-from app.database.models.enums import TelegramContentStatus, TelegramProcessingMode
+from app.database.models.enums import TelegramContentStatus, TelegramContentTarget, TelegramProcessingMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,13 +16,14 @@ class TopicMappingListItem:
     chat_id: int
     message_thread_id: int
     topic_name: str | None
-    parent_page_id: int
-    parent_page_key: str
-    parent_page_title: str
+    parent_page_id: int | None
+    parent_page_key: str | None
+    parent_page_title: str | None
     is_active: bool
     auto_draft_enabled: bool
     processing_mode: TelegramProcessingMode
     auto_attach_materials: bool
+    content_target: TelegramContentTarget = TelegramContentTarget.PAGE
 
 
 class TelegramAutoDraftRepository:
@@ -73,8 +74,9 @@ class TelegramAutoDraftRepository:
                 TelegramTopicPageMapping.auto_draft_enabled,
                 TelegramTopicPageMapping.processing_mode,
                 TelegramTopicPageMapping.auto_attach_materials,
+                TelegramTopicPageMapping.content_target,
             )
-            .join(BotPage, BotPage.id == TelegramTopicPageMapping.parent_page_id)
+            .outerjoin(BotPage, BotPage.id == TelegramTopicPageMapping.parent_page_id)
             .outerjoin(BotPageRevision, BotPageRevision.id == BotPage.draft_revision_id)
             .outerjoin(
                 TelegramForumTopic,
@@ -102,10 +104,16 @@ class TelegramAutoDraftRepository:
         return int(result.rowcount or 0)
 
     async def seen_threads(self, chat_id: int) -> list[int]:
+        discovered = select(TelegramForumTopic.message_thread_id.label("message_thread_id")).where(
+            TelegramForumTopic.chat_id == chat_id
+        )
+        observed = select(TelegramContentPost.message_thread_id.label("message_thread_id")).where(
+            TelegramContentPost.chat_id == chat_id,
+            TelegramContentPost.message_thread_id.is_not(None),
+        )
+        combined = discovered.union(observed).subquery()
         return list((await self.session.scalars(
-            select(TelegramContentPost.message_thread_id)
-            .where(TelegramContentPost.chat_id == chat_id, TelegramContentPost.message_thread_id.is_not(None))
-            .distinct().order_by(TelegramContentPost.message_thread_id)
+            select(combined.c.message_thread_id).order_by(combined.c.message_thread_id)
         )).all())
 
     async def topic_names(self, chat_id: int, thread_ids: list[int] | None = None) -> dict[int, str]:

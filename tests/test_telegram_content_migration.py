@@ -9,14 +9,17 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.ai.index import KnowledgeIndexService
-from app.database.models import AIKnowledgeChunk, AIKnowledgeSyncJob, AuditLog, BotPageRevision, PageAttachment, TelegramAttachmentReplacement, TelegramAutoDraftLink, TelegramContentMedia, TelegramContentPost, TelegramEditPending, TelegramImportSettings, TelegramTopicPageMapping
-from app.database.models.enums import ButtonAction, LanguageCode, MediaType, PageStatus, TelegramContentStatus, TelegramEditSyncMode, TelegramFileSyncMode, TelegramProcessingMode
+from app.database.models import AIKnowledgeChunk, AIKnowledgeSyncJob, AuditLog, BotPageRevision, FAQItem, FAQRevision, PageAttachment, TelegramAttachmentReplacement, TelegramAutoDraftLink, TelegramContentMedia, TelegramContentPost, TelegramEditPending, TelegramFAQEditPending, TelegramFAQSyncLink, TelegramForumTopic, TelegramImportSettings, TelegramTopicPageMapping
+from app.database.models.enums import ButtonAction, LanguageCode, MediaType, PageStatus, TelegramContentStatus, TelegramContentTarget, TelegramEditSyncMode, TelegramFileSyncMode, TelegramProcessingMode
 from app.database.repositories.pages import PageRepository
-from app.services.cms import ButtonService
+from app.database.repositories.telegram_auto_drafts import TelegramAutoDraftRepository
+from app.services.cms import ButtonService, FAQService
+from app.services.channel_import import TelegramContentImportService
 from app.services.pages import PageService
 from app.services.knowledge_sync import process_knowledge_job
 from app.services.telegram_auto_drafts import TelegramAutoDraftService
 from app.services.telegram_edit_sync import TelegramEditSyncService
+from app.services.telegram_faq_edit_sync import TelegramFAQEditSyncService
 from app.services.telegram_attachment_sync import TelegramAttachmentSyncService
 
 
@@ -30,6 +33,22 @@ BILINGUAL = """5️⃣ ПРАКТИКА БОЙЫНША ЕСЕП ҮЛГІЛЕРІ
 
 BILINGUAL_EDITED = BILINGUAL.replace("төменнен жүктеп алуға болады", "жаңартылған үлгілерді жүктеп алуға болады").replace(
     "можно скачать ниже", "можно скачать обновлённые файлы ниже"
+)
+
+FAQ_BILINGUAL = """❓ UTS жүйесіне қалай кіруге болады?
+
+UTS жүйесіне университет берген логин және құпиясөз арқылы кіруге болады.
+
+━━━━━━━━━━━━━━
+
+❓ Как войти в UTS?
+
+Для входа используйте логин и пароль, выданные университетом."""
+
+FAQ_BILINGUAL_EDITED = FAQ_BILINGUAL.replace(
+    "логин және құпиясөз", "логин, құпиясөз және растау кодын",
+).replace(
+    "логин и пароль", "логин, пароль и код подтверждения",
 )
 
 
@@ -179,6 +198,139 @@ class TelegramContentMigrationTests(unittest.IsolatedAsyncioTestCase):
             await connection.run_sync(self._assert_model_column_parity)
         await self._orm_smoke_test(message_id=88)
 
+    async def test_forum_topic_event_is_immediately_discoverable_without_content_post(self) -> None:
+        self.alembic("upgrade", "head")
+        session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with session_factory() as session:
+            repository = TelegramAutoDraftRepository(session)
+            await repository.upsert_topic_name(-100123, 2, "Практика")
+            await session.commit()
+
+            self.assertEqual(await repository.seen_threads(-100123), [2])
+            self.assertEqual(await repository.topic_names(-100123), {2: "Практика"})
+            content_count = await session.scalar(sa.select(sa.func.count(TelegramContentPost.id)))
+            self.assertEqual(content_count, 0)
+
+            parent_id = await session.scalar(sa.text(
+                "INSERT INTO bot_pages (key, status, position, is_active) "
+                "VALUES ('topic-parent', 'PUBLISHED', 0, true) RETURNING id"
+            ))
+            session.add(TelegramTopicPageMapping(
+                chat_id=-100123,
+                message_thread_id=2,
+                parent_page_id=parent_id,
+            ))
+            await session.commit()
+
+            await repository.upsert_topic_name(-100123, 2, "Практика и трудоустройство")
+            await repository.upsert_topic_name(-100123, 2, "Практика и трудоустройство")
+            await session.commit()
+
+            topics = list((await session.scalars(sa.select(TelegramForumTopic))).all())
+            mapping = await repository.mapping(-100123, 2)
+            self.assertEqual(len(topics), 1)
+            self.assertEqual(topics[0].topic_name, "Практика и трудоустройство")
+            self.assertIsNotNone(mapping)
+            self.assertEqual(mapping.parent_page_id, parent_id)
+
+            await session.execute(sa.text(
+                "INSERT INTO telegram_content_posts "
+                "(chat_id, message_id, message_thread_id, chat_type, status, text) "
+                "VALUES (-100123, 77, 30, 'supergroup', 'NEW', 'Observed content')"
+            ))
+            await session.commit()
+            self.assertEqual(await repository.seen_threads(-100123), [2, 30])
+
+    async def test_faq_revision_auto_review_conflict_and_idempotency(self) -> None:
+        self.alembic("upgrade", "head")
+        factory = async_sessionmaker(self.engine, expire_on_commit=False)
+        now = datetime.now(timezone.utc)
+        async with factory() as session:
+            mapping = TelegramTopicPageMapping(
+                chat_id=-100500, message_thread_id=9, parent_page_id=None,
+                content_target=TelegramContentTarget.FAQ,
+                processing_mode=TelegramProcessingMode.AUTO_PUBLISH,
+                edit_sync_mode=TelegramEditSyncMode.AUTO,
+            )
+            post = TelegramContentPost(
+                chat_id=-100500, message_id=100, message_thread_id=9,
+                chat_type="supergroup", status=TelegramContentStatus.NEW,
+                text=FAQ_BILINGUAL, telegram_created_at=now,
+            )
+            session.add_all([mapping, post]); await session.flush()
+            faq = await TelegramContentImportService(session).create_faq(
+                post.id, post.chat_id, 42,
+                question_ru="Как войти в UTS?", answer_ru="Для входа используйте логин и пароль, выданные университетом.",
+                question_kk="UTS жүйесіне қалай кіруге болады?", answer_kk="UTS жүйесіне университет берген логин және құпиясөз арқылы кіруге болады.",
+                is_active=True,
+            )
+            faq_id, post_id = faq.id, post.id
+            await session.commit()
+
+        async with factory() as session:
+            result = await TelegramFAQEditSyncService(session, 42).process(post_id, FAQ_BILINGUAL_EDITED, now + timedelta(seconds=10))
+            self.assertEqual(result.status, "APPLIED")
+            await session.commit()
+            faq = await session.get(FAQItem, faq_id)
+            revisions = list((await session.scalars(sa.select(FAQRevision).where(FAQRevision.faq_id == faq_id).order_by(FAQRevision.version))).all())
+            self.assertEqual(len(revisions), 2)
+            self.assertEqual(revisions[0].answer_ru, "Для входа используйте логин и пароль, выданные университетом.")
+            self.assertIn("код подтверждения", revisions[1].answer_ru)
+            self.assertEqual(await session.scalar(sa.select(sa.func.count()).select_from(FAQItem)), 1)
+            link = await session.scalar(sa.select(TelegramFAQSyncLink).where(TelegramFAQSyncLink.faq_id == faq_id))
+            job = await session.scalar(sa.select(AIKnowledgeSyncJob).where(AIKnowledgeSyncJob.faq_id == faq_id))
+            self.assertEqual(link.last_synced_revision_id, faq.current_revision_id)
+            self.assertEqual(job.faq_revision_id, faq.current_revision_id)
+
+            duplicate = await TelegramFAQEditSyncService(session, 42).process(post_id, FAQ_BILINGUAL_EDITED, now + timedelta(seconds=10))
+            stale = await TelegramFAQEditSyncService(session, 42).process(post_id, FAQ_BILINGUAL, now + timedelta(seconds=5))
+            self.assertEqual(duplicate.status, "UNCHANGED")
+            self.assertEqual(stale.status, "STALE")
+            self.assertEqual(await session.scalar(sa.select(sa.func.count(FAQRevision.id)).where(FAQRevision.faq_id == faq_id)), 2)
+
+            await FAQService(session).update_translation(77, faq, LanguageCode.RU, answer="Ручное изменение администратора")
+            await session.flush()
+            conflict_text = FAQ_BILINGUAL_EDITED.replace("код подтверждения", "одноразовый код")
+            conflict = await TelegramFAQEditSyncService(session, 42).process(post_id, conflict_text, now + timedelta(seconds=20))
+            self.assertEqual(conflict.status, "CONFLICT")
+            pending = await session.get(TelegramFAQEditPending, conflict.pending_id)
+            self.assertEqual(pending.status, "CONFLICT")
+            self.assertEqual(faq.answer, "Ручное изменение администратора")
+
+            link.last_synced_revision_id = faq.current_revision_id
+            mapping = await session.scalar(sa.select(TelegramTopicPageMapping).where(TelegramTopicPageMapping.message_thread_id == 9))
+            mapping.edit_sync_mode = TelegramEditSyncMode.REVIEW
+            review_text = FAQ_BILINGUAL_EDITED.replace("код подтверждения", "SMS-код")
+            review = await TelegramFAQEditSyncService(session, 42).process(post_id, review_text, now + timedelta(seconds=30))
+            self.assertEqual(review.status, "REVIEW")
+            before_apply = faq.current_revision_id
+            self.assertNotEqual(pending.source_fingerprint, link.source_fingerprint)
+            applied_id = await TelegramFAQEditSyncService(session, 77).apply_pending(review.pending_id)
+            self.assertEqual(applied_id, faq_id)
+            self.assertNotEqual(faq.current_revision_id, before_apply)
+            self.assertEqual(await TelegramFAQEditSyncService(session, 77).apply_pending(review.pending_id), faq_id)
+
+            reject_text = FAQ_BILINGUAL_EDITED.replace("код подтверждения", "резервный код")
+            rejected = await TelegramFAQEditSyncService(session, 42).process(post_id, reject_text, now + timedelta(seconds=35))
+            revision_before_reject = faq.current_revision_id
+            await TelegramFAQEditSyncService(session, 77).reject_pending(rejected.pending_id)
+            self.assertEqual(faq.current_revision_id, revision_before_reject)
+            self.assertEqual((await session.get(TelegramFAQEditPending, rejected.pending_id)).status, "REJECTED")
+
+            mapping.edit_sync_mode = TelegramEditSyncMode.AUTO
+            incomplete = await TelegramFAQEditSyncService(session, 42).process(
+                post_id, "❓ Только вопрос без двуязычного ответа?", now + timedelta(seconds=38),
+            )
+            self.assertEqual(incomplete.status, "INCOMPLETE")
+            self.assertEqual(faq.current_revision_id, revision_before_reject)
+
+            mapping.edit_sync_mode = TelegramEditSyncMode.OFF
+            revision_before_off = faq.current_revision_id
+            off = await TelegramFAQEditSyncService(session, 42).process(post_id, FAQ_BILINGUAL, now + timedelta(seconds=40))
+            self.assertEqual(off.status, "OFF")
+            self.assertEqual(faq.current_revision_id, revision_before_off)
+            await session.commit()
+
     async def test_previous_head_forum_topic_upgrade_and_downgrade(self) -> None:
         self.alembic("upgrade", "20261007_09")
         async with self.engine.connect() as connection:
@@ -268,6 +420,53 @@ class TelegramContentMigrationTests(unittest.IsolatedAsyncioTestCase):
             tables = set(await connection.run_sync(lambda conn: sa.inspect(conn).get_table_names()))
             self.assertIn("telegram_attachment_replacements", tables)
         self.alembic("downgrade", "20261008_12")
+
+    async def test_faq_target_migration_defaults_existing_mappings_to_page_and_downgrades(self) -> None:
+        self.alembic("upgrade", "20261008_13")
+        async with self.engine.begin() as connection:
+            parent_id = await connection.scalar(sa.text(
+                "INSERT INTO bot_pages (key, status, position, is_active) VALUES ('faq-migration-parent', 'PUBLISHED', 0, true) RETURNING id"
+            ))
+            await connection.execute(sa.text(
+                "INSERT INTO telegram_topic_page_mappings "
+                "(chat_id, message_thread_id, parent_page_id, is_active, auto_draft_enabled, processing_mode, processing_mode_enabled_at, edit_sync_mode, file_sync_mode, auto_attach_materials) "
+                "VALUES (-1001, 77, :parent, true, true, 'AUTO_DRAFT', now(), 'OFF', 'OFF', true)"
+            ), {"parent": parent_id})
+        self.alembic("upgrade", "20261008_14")
+        async with self.engine.connect() as connection:
+            self.assertEqual(await connection.scalar(sa.text(
+                "SELECT content_target FROM telegram_topic_page_mappings WHERE message_thread_id=77"
+            )), "PAGE")
+        self.alembic("downgrade", "20261008_13")
+        async with self.engine.connect() as connection:
+            columns = {item["name"] for item in await connection.run_sync(lambda conn: sa.inspect(conn).get_columns("telegram_topic_page_mappings"))}
+            self.assertNotIn("content_target", columns)
+
+    async def test_faq_revision_migration_backfills_and_preserves_existing_faq(self) -> None:
+        self.alembic("upgrade", "20261008_14")
+        async with self.engine.begin() as connection:
+            faq_id = await connection.scalar(sa.text(
+                "INSERT INTO faq_items (question, answer, position, is_active) "
+                "VALUES ('Старый вопрос?', 'Старый ответ', 0, true) RETURNING id"
+            ))
+            await connection.execute(sa.text(
+                "INSERT INTO faq_item_translations (faq_id, language_code, question, answer) VALUES "
+                "(:faq, 'RU', 'Старый вопрос?', 'Старый ответ'), "
+                "(:faq, 'KK', 'Ескі сұрақ?', 'Ескі жауап')"
+            ), {"faq": faq_id})
+        self.alembic("upgrade", "20261009_15")
+        async with self.engine.connect() as connection:
+            row = (await connection.execute(sa.text(
+                "SELECT f.question, f.current_revision_id, r.version, r.question_kk, r.source_type "
+                "FROM faq_items f JOIN faq_revisions r ON r.id=f.current_revision_id WHERE f.id=:faq"
+            ), {"faq": faq_id})).mappings().one()
+            self.assertEqual(row["question"], "Старый вопрос?")
+            self.assertEqual((row["version"], row["question_kk"], row["source_type"]), (1, "Ескі сұрақ?", "MANUAL"))
+        self.alembic("downgrade", "20261008_14")
+        async with self.engine.connect() as connection:
+            self.assertEqual(await connection.scalar(sa.text("SELECT question FROM faq_items WHERE id=:faq"), {"faq": faq_id}), "Старый вопрос?")
+            tables = set(await connection.run_sync(lambda conn: sa.inspect(conn).get_table_names()))
+            self.assertNotIn("faq_revisions", tables)
 
     async def test_attachment_review_auto_history_and_conflict_safety(self) -> None:
         self.alembic("upgrade", "head")
@@ -368,6 +567,60 @@ class TelegramContentMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(page.published_revision_id, new_attachment.revision_id)
             pending = await session.scalar(sa.select(TelegramAttachmentReplacement).where(TelegramAttachmentReplacement.source_post_id == post_id))
             self.assertEqual(pending.status, "CONFLICT")
+
+    async def test_telegram_faq_auto_draft_and_publish_are_idempotent(self) -> None:
+        self.alembic("upgrade", "head")
+        factory = async_sessionmaker(self.engine, expire_on_commit=False)
+        now = datetime.now(timezone.utc)
+        async with factory() as session:
+            session.add(TelegramImportSettings(
+                chat_id=-1001, auto_draft_enabled=True,
+                auto_draft_enabled_at=now - timedelta(minutes=1), notify_admins=False,
+            ))
+            session.add_all([
+                TelegramTopicPageMapping(
+                    chat_id=-1001, message_thread_id=40, parent_page_id=None,
+                    content_target=TelegramContentTarget.FAQ,
+                    processing_mode=TelegramProcessingMode.AUTO_DRAFT,
+                    processing_mode_enabled_at=now - timedelta(seconds=30),
+                ),
+                TelegramTopicPageMapping(
+                    chat_id=-1001, message_thread_id=41, parent_page_id=None,
+                    content_target=TelegramContentTarget.FAQ,
+                    processing_mode=TelegramProcessingMode.AUTO_PUBLISH,
+                    processing_mode_enabled_at=now - timedelta(seconds=30),
+                ),
+            ])
+            draft_source = TelegramContentPost(
+                chat_id=-1001, message_id=801, message_thread_id=40, chat_type="supergroup",
+                status=TelegramContentStatus.NEW, text=FAQ_BILINGUAL, telegram_created_at=now,
+            )
+            published_source = TelegramContentPost(
+                chat_id=-1001, message_id=802, message_thread_id=41, chat_type="supergroup",
+                status=TelegramContentStatus.NEW, text=FAQ_BILINGUAL, telegram_created_at=now,
+            )
+            session.add_all([draft_source, published_source])
+            await session.flush()
+            page_count_before = await session.scalar(sa.select(sa.func.count()).select_from(sa.text("bot_pages")))
+            draft_result = await TelegramAutoDraftService(session, -1001, 42).process_claimed(draft_source)
+            published_result = await TelegramAutoDraftService(session, -1001, 42).process_claimed(published_source)
+            self.assertFalse(draft_result.published)
+            self.assertTrue(published_result.published)
+            await session.commit()
+            ids = (draft_result.faq_id, published_result.faq_id)
+
+        async with factory() as session:
+            draft = await session.get(FAQItem, ids[0])
+            published = await session.get(FAQItem, ids[1])
+            self.assertFalse(draft.is_active)
+            self.assertTrue(published.is_active)
+            for item in (draft, published):
+                translations = {row.language_code: row for row in item.translations}
+                self.assertEqual(set(translations), {LanguageCode.RU, LanguageCode.KK})
+            self.assertEqual(await session.scalar(sa.select(sa.func.count()).select_from(sa.text("bot_pages"))), page_count_before)
+            self.assertIsNone(await session.scalar(sa.select(AIKnowledgeSyncJob).where(AIKnowledgeSyncJob.faq_id == draft.id)))
+            self.assertIsNotNone(await session.scalar(sa.select(AIKnowledgeSyncJob).where(AIKnowledgeSyncJob.faq_id == published.id)))
+            self.assertEqual(await session.scalar(sa.select(sa.func.count()).select_from(FAQItem)), 2)
 
     async def test_auto_draft_publish_creates_and_recovers_parent_button(self) -> None:
         self.alembic("upgrade", "head")

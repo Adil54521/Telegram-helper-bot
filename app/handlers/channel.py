@@ -15,8 +15,9 @@ from app.database.repositories.telegram_auto_drafts import TelegramAutoDraftRepo
 from app.services.channel_import import IngestResult, TelegramContentImportService, message_media, source_text, suggested_title
 from app.services.permissions import Permission, ROLE_PERMISSIONS
 from app.services.telegram_auto_drafts import TelegramAutoDraftService, processing_mode
-from app.database.models.enums import TelegramProcessingMode
+from app.database.models.enums import TelegramContentTarget, TelegramProcessingMode
 from app.services.telegram_edit_sync import TelegramEditSyncService
+from app.services.telegram_faq_edit_sync import TelegramFAQEditSyncService
 from app.services.telegram_attachment_sync import TelegramAttachmentSyncService
 from app.utils.presentation import html_text, text_preview
 
@@ -57,10 +58,16 @@ class OfficialGroupContentFilter(ConfiguredGroupFilter):
 
 @router.message(ConfiguredGroupFilter(), F.forum_topic_created | F.forum_topic_edited)
 async def capture_forum_topic_metadata(message: Message, session: AsyncSession) -> None:
+    if message.chat.type != ChatType.SUPERGROUP:
+        return
     thread_id = message.message_thread_id
     event = message.forum_topic_created or message.forum_topic_edited
     topic_name = (getattr(event, "name", None) or "").strip()
-    if thread_id is None or not topic_name:
+    if thread_id is None:
+        logger.debug("Telegram forum topic metadata skipped reason=missing_thread_id chat_id=%s", message.chat.id)
+        return
+    if not topic_name:
+        logger.debug("Telegram forum topic metadata skipped reason=missing_name chat_id=%s thread_id=%s", message.chat.id, thread_id)
         return
     await TelegramAutoDraftRepository(session).upsert_topic_name(message.chat.id, thread_id, topic_name[:255])
     logger.info("Telegram forum topic metadata updated chat_id=%s thread_id=%s", message.chat.id, thread_id)
@@ -129,6 +136,27 @@ async def _notify_attachment_review(bot: Bot, session: AsyncSession, settings: S
             logger.warning("Telegram attachment review notification failed admin_id=%s error=%s", telegram_id, type(error).__name__)
 
 
+async def _notify_faq_edit(bot: Bot, session: AsyncSession, settings: Settings, item_id: int, status: str) -> None:
+    if settings.content_chat_id is None or not await TelegramAutoDraftRepository(session).notifications_enabled(
+        settings.content_chat_id, settings.content_channel_notify_admins,
+    ):
+        return
+    admins = list((await session.scalars(select(Admin).where(Admin.is_active.is_(True)))).all())
+    recipients = {admin.telegram_id for admin in admins if Permission.CONTENT in ROLE_PERMISSIONS.get(admin.role, set())}
+    recipients.add(settings.super_admin_id)
+    markup = None
+    if status != "APPLIED":
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="👁 Проверить FAQ", callback_data=ChannelPostCallback(action="faq_edit_open", item_id=item_id).pack())
+        ]])
+    text = "✅ <b>Telegram FAQ обновлён</b>" if status == "APPLIED" else "⚠️ <b>Изменение Telegram FAQ требует проверки</b>"
+    for telegram_id in recipients:
+        try:
+            await bot.send_message(telegram_id, f"{text}\n\nСтатус: {html_text(status)}", reply_markup=markup)
+        except TelegramAPIError as error:
+            logger.warning("Telegram FAQ edit notification failed admin_id=%s error=%s", telegram_id, type(error).__name__)
+
+
 async def _should_notify_new_post(session: AsyncSession, post) -> bool:
     if post.message_thread_id is None:
         return True
@@ -145,17 +173,27 @@ async def _ingest(message: Message, session: AsyncSession, settings: Settings, b
         return None
     if isinstance(session, AsyncSession):
         if edited and result.post.status.value != "NEW":
-            file_result = await TelegramAttachmentSyncService(session, settings.super_admin_id).process_edit(
-                result.post.id, message_media(message), message.message_id,
-            )
-            if file_result.pending_id:
-                await _notify_attachment_review(bot, session, settings, file_result.pending_id, file_result.status)
-            edit_result = await TelegramEditSyncService(session, settings.super_admin_id).process(
-                result.post.id,
-                (message.text or message.caption or "").strip(),
-            )
-            if edit_result.pending_id:
-                await _notify_edit_review(bot, session, settings, edit_result.pending_id, edit_result.status)
+            mapping = await TelegramAutoDraftRepository(session).mapping(result.post.chat_id, result.post.message_thread_id) if result.post.message_thread_id is not None else None
+            if mapping and mapping.content_target == TelegramContentTarget.FAQ:
+                faq_result = await TelegramFAQEditSyncService(session, settings.super_admin_id).process(
+                    result.post.id, (message.text or message.caption or "").strip(), message.edit_date,
+                )
+                if faq_result.pending_id:
+                    await _notify_faq_edit(bot, session, settings, faq_result.pending_id, faq_result.status)
+                elif faq_result.status == "APPLIED" and faq_result.faq_id:
+                    await _notify_faq_edit(bot, session, settings, faq_result.faq_id, faq_result.status)
+            else:
+                file_result = await TelegramAttachmentSyncService(session, settings.super_admin_id).process_edit(
+                    result.post.id, message_media(message), message.message_id,
+                )
+                if file_result.pending_id:
+                    await _notify_attachment_review(bot, session, settings, file_result.pending_id, file_result.status)
+                edit_result = await TelegramEditSyncService(session, settings.super_admin_id).process(
+                    result.post.id,
+                    (message.text or message.caption or "").strip(),
+                )
+                if edit_result.pending_id:
+                    await _notify_edit_review(bot, session, settings, edit_result.pending_id, edit_result.status)
         else:
             await TelegramAutoDraftService(session, settings.content_chat_id, settings.super_admin_id).schedule(result.post, result.media_count)
     logger.info("Telegram content received chat_id=%s message_id=%s thread_id=%s chat_type=%s media_count=%s status=%s edited=%s", message.chat.id, message.message_id, message.message_thread_id, message.chat.type, result.media_count, result.post.status.value, edited)

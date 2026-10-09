@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import Admin, AuditLog, BotButton, BotButtonTranslation, FAQItem, FAQItemTranslation
 from app.database.models.enums import AdminRole, ButtonAction, LanguageCode
 from app.database.repositories.cms import CMSRepository
+from app.services.faq_revisions import create_faq_revision
 
 
 def audit(session: AsyncSession, actor: int, action: str, kind: str, entity_id: int, old: dict[str, Any] | None = None, new: dict[str, Any] | None = None) -> None:
@@ -56,14 +57,17 @@ class ButtonService:
 
 class FAQService:
     def __init__(self, session: AsyncSession) -> None: self.session, self.repo = session, CMSRepository(session)
-    async def create(self, actor: int, question: str, answer: str, question_kk: str | None = None, answer_kk: str | None = None, *, is_active: bool = True) -> FAQItem:
+    async def create(self, actor: int, question: str, answer: str, question_kk: str | None = None, answer_kk: str | None = None, *, is_active: bool = True, source_type: str = "MANUAL", source_post_id: int | None = None) -> FAQItem:
         item = FAQItem(question=question, answer=answer, position=len(await self.repo.faqs()), is_active=is_active)
         self.session.add(item); await self.session.flush(); self.session.add(FAQItemTranslation(faq_id=item.id,language_code=LanguageCode.RU,question=question,answer=answer))
         if question_kk and answer_kk:self.session.add(FAQItemTranslation(faq_id=item.id,language_code=LanguageCode.KK,question=question_kk,answer=answer_kk))
+        await create_faq_revision(self.session,item,actor,source_type=source_type,source_post_id=source_post_id)
         audit(self.session, actor, "FAQ_CREATED", "FAQItem", item.id, new={"question": question}); return item
     async def update(self, actor: int, item: FAQItem, **values: Any) -> None:
         old = {k: getattr(item, k) for k in values}
         for k, v in values.items(): setattr(item, k, v)
+        if {"question", "answer"}.intersection(values):
+            await create_faq_revision(self.session,item,actor,source_type="MANUAL")
         audit(self.session, actor, "FAQ_UPDATED", "FAQItem", item.id, old=old, new=values)
     async def update_translation(self,actor:int,item:FAQItem,language:LanguageCode,**values:Any)->None:
         translation=next((x for x in item.translations if x.language_code==language),None);old=None if not translation else {"question":translation.question,"answer":translation.answer}
@@ -73,6 +77,7 @@ class FAQService:
             for k,v in values.items():setattr(translation,k,v)
         if language==LanguageCode.RU:
             for k,v in values.items():setattr(item,k,v)
+        await create_faq_revision(self.session,item,actor,source_type="MANUAL")
         audit(self.session,actor,"FAQ_TRANSLATION_UPDATED","FAQItem",item.id,old=old,new={"language":language.value,**values})
     async def move(self, actor: int, item: FAQItem, delta: int) -> None:
         items=await self.repo.faqs(); i=items.index(item); j=max(0,min(len(items)-1,i+delta)); items[i],items[j]=items[j],items[i]

@@ -4,12 +4,13 @@ from dataclasses import dataclass
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import AuditLog, PageAttachment, TelegramContentMedia, TelegramContentPost
+from app.database.models import AuditLog, PageAttachment, TelegramContentMedia, TelegramContentPost, TelegramFAQSyncLink
 from app.database.models.enums import LanguageCode, MediaType, TelegramContentStatus
 from app.database.repositories.channel_posts import TelegramContentRepository
 from app.services.cms import FAQService
 from app.services.pages import PageService
 from app.services.telegram_publication_grouper import SelectedPublicationMaterial, TelegramPublicationGrouper
+from app.services.telegram_edit_sync import source_fingerprint
 
 MAX_TRANSFER_DOCUMENT_SIZE = 20 * 1024 * 1024
 
@@ -185,13 +186,24 @@ class TelegramContentImportService:
     async def create_faq(
         self, item_id: int, chat_id: int, actor: int, *,
         question_ru: str, answer_ru: str, question_kk: str | None = None, answer_kk: str | None = None,
+        is_active: bool = True,
     ):
         post = await self._new_locked(item_id, chat_id)
-        faq = await FAQService(self.session).create(actor, question_ru, answer_ru, question_kk, answer_kk)
+        faq = await FAQService(self.session).create(
+            actor, question_ru, answer_ru, question_kk, answer_kk,
+            is_active=is_active, source_type="TELEGRAM", source_post_id=post.id,
+        )
         post.status = TelegramContentStatus.DRAFT_CREATED
         post.created_faq_id = faq.id
         post.processed_by = actor
         post.processed_at = datetime.now(timezone.utc)
+        self.session.add(TelegramFAQSyncLink(
+            source_post_id=post.id,
+            faq_id=faq.id,
+            last_synced_revision_id=faq.current_revision_id,
+            source_fingerprint=source_fingerprint(source_text(post)),
+            last_synced_at=datetime.now(timezone.utc),
+        ))
         self._audit(actor, "CHANNEL_POST_FAQ_CREATED", post, {"faq_id": faq.id})
         return faq
 

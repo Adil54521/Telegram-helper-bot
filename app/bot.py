@@ -22,6 +22,13 @@ from app.ai.service import AIService
 from app.utils.logging import configure_logging
 
 
+def polling_allowed_updates(dispatcher: Dispatcher) -> list[str]:
+    updates = dispatcher.resolve_used_update_types()
+    if "message" not in updates:
+        updates.append("message")
+    return updates
+
+
 async def handle_update_error(event: ErrorEvent, logger: logging.Logger) -> bool:
     logger.exception("Unhandled update error", exc_info=event.exception)
     callback = event.update.callback_query
@@ -94,7 +101,7 @@ async def main() -> None:
         ai_service.knowledge_index if ai_service else None,
     ))
     try:
-        await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
+        await dispatcher.start_polling(bot, allowed_updates=polling_allowed_updates(dispatcher))
     finally:
         auto_stop.set()
         await auto_task

@@ -9,17 +9,18 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.callbacks import AdminPageCallback, ChannelPostCallback
+from app.callbacks import AdminPageCallback, ChannelPostCallback, FAQCallback
 from app.config import Settings
 from app.database.models import Admin, AuditLog, BotPage, TelegramAutoDraftLink, TelegramContentPost
-from app.database.models.enums import PageStatus, TelegramContentStatus, TelegramProcessingMode
+from app.database.models.enums import PageStatus, TelegramContentStatus, TelegramContentTarget, TelegramProcessingMode
 from app.database.repositories.telegram_auto_drafts import TelegramAutoDraftRepository
 from app.services.channel_import import TelegramContentImportService, source_text
 from app.services.permissions import Permission, ROLE_PERMISSIONS
 from app.services.pages import PageService
-from app.services.knowledge_sync import process_knowledge_job, recover_knowledge_jobs
+from app.services.knowledge_sync import process_knowledge_job, queue_faq_knowledge_sync, recover_knowledge_jobs
 from app.services.telegram_content_parser import TelegramContentConfidence, TelegramContentParseKind, TelegramContentParser
 from app.services.telegram_edit_sync import source_fingerprint
+from app.services.telegram_faq_parser import TelegramFAQParser
 from app.services.telegram_publication_grouper import SelectedPublicationMaterial, TelegramPublicationGrouper
 from app.database.repositories.channel_posts import TelegramContentRepository
 from app.utils.presentation import html_text, text_preview
@@ -37,6 +38,8 @@ class AutoDraftCreated:
     section_title: str
     media_count: int
     published: bool
+    content_target: TelegramContentTarget = TelegramContentTarget.PAGE
+    faq_id: int | None = None
 
 
 def processing_mode(mapping) -> TelegramProcessingMode:
@@ -53,8 +56,16 @@ class TelegramAutoDraftService:
         self.actor = actor
         self.repo = TelegramAutoDraftRepository(session)
         self.parser = TelegramContentParser()
+        self.faq_parser = TelegramFAQParser()
 
     async def schedule(self, post: TelegramContentPost, media_count: int = 0) -> None:
+        logger.warning(
+            "AUTO SCHEDULE ENTER post_id=%s chat_id=%s thread_id=%s status=%s",
+            post.id,
+            post.chat_id,
+            post.message_thread_id,
+            post.status,
+        )
         if post.chat_id != self.chat_id or post.status != TelegramContentStatus.NEW or post.message_thread_id is None:
             return
         config = await self.repo.settings(post.chat_id)
@@ -70,8 +81,12 @@ class TelegramAutoDraftService:
         deadline = datetime.now(timezone.utc) + timedelta(seconds=config.settle_seconds)
         value = source_text(post)
         is_probable_material = media_count > 0 and len(value) <= 240
-        parsed = self.parser.parse(value)
-        if not is_probable_material and parsed.kind != TelegramContentParseKind.UNKNOWN:
+        if mapping.content_target == TelegramContentTarget.FAQ:
+            faq = self.faq_parser.parse(value)
+            recognizable = faq.is_complete or faq.diagnostic in {"FAQ_INCOMPLETE", "FAQ_AMBIGUOUS"}
+        else:
+            recognizable = self.parser.parse(value).kind != TelegramContentParseKind.UNKNOWN
+        if not is_probable_material and recognizable:
             post.auto_process_after = deadline
             post.auto_processing_attempts = 0
             post.auto_last_error = None
@@ -82,22 +97,48 @@ class TelegramAutoDraftService:
 
     async def process_claimed(self, post: TelegramContentPost) -> AutoDraftCreated | None:
         post.auto_process_after = None
-        if post.chat_id != self.chat_id or post.message_thread_id is None:
+        if post.chat_id != self.chat_id or post.message_thread_id is None or post.status != TelegramContentStatus.NEW or post.created_faq_id:
             return None
         config = await self.repo.settings(post.chat_id)
         mapping = await self.repo.mapping(post.chat_id, post.message_thread_id)
-        parent = await self.session.get(BotPage, mapping.parent_page_id) if mapping else None
+        parent = await self.session.get(BotPage, mapping.parent_page_id) if mapping and mapping.parent_page_id else None
         received = post.telegram_created_at or post.created_at
         if not config or not config.auto_draft_enabled or not config.auto_draft_enabled_at:
             return None
         if not mapping or not mapping.is_active or processing_mode(mapping) == TelegramProcessingMode.MANUAL:
             return None
-        if not parent or not parent.is_active or parent.status != PageStatus.PUBLISHED:
+        if mapping.content_target == TelegramContentTarget.PAGE and (not parent or not parent.is_active or parent.status != PageStatus.PUBLISHED):
             post.auto_last_error = "parent page is not active and published"
             return None
         mode_boundary = mapping.processing_mode_enabled_at or config.auto_draft_enabled_at
         if not received or received < config.auto_draft_enabled_at or (mode_boundary and received < mode_boundary):
             return None
+        if mapping.content_target == TelegramContentTarget.FAQ:
+            media_count = await TelegramContentRepository(self.session).media_count(post.id)
+            parsed_faq = self.faq_parser.parse(source_text(post))
+            if media_count:
+                post.auto_last_error = "FAQ_REVIEW_REQUIRED: attachments are not supported"
+                self.session.add(AuditLog(admin_id=self.actor, action="TELEGRAM_FAQ_REVIEW_REQUIRED", entity_type="TelegramContentPost", entity_id=str(post.id), new_data={"reason": "attachments"}))
+                return None
+            if not parsed_faq.is_complete or parsed_faq.confidence != TelegramContentConfidence.HIGH:
+                post.auto_last_error = parsed_faq.diagnostic
+                self.session.add(AuditLog(admin_id=self.actor, action="TELEGRAM_FAQ_REVIEW_REQUIRED", entity_type="TelegramContentPost", entity_id=str(post.id), new_data={"reason": parsed_faq.diagnostic}))
+                return None
+            mode = processing_mode(mapping)
+            faq = await TelegramContentImportService(self.session).create_faq(
+                post.id, post.chat_id, self.actor,
+                question_ru=parsed_faq.question_ru or "", answer_ru=parsed_faq.answer_ru or "",
+                question_kk=parsed_faq.question_kk, answer_kk=parsed_faq.answer_kk,
+                is_active=mode == TelegramProcessingMode.AUTO_PUBLISH,
+            )
+            action = "TELEGRAM_FAQ_AUTO_PUBLISHED" if faq.is_active else "TELEGRAM_FAQ_DRAFT_CREATED"
+            self.session.add(AuditLog(admin_id=self.actor, action=action, entity_type="FAQItem", entity_id=str(faq.id), new_data={"source_post_id": post.id, "thread_id": post.message_thread_id}))
+            if faq.is_active:
+                await queue_faq_knowledge_sync(self.session, faq.id, self.actor)
+            topic_names = await self.repo.topic_names(post.chat_id, [post.message_thread_id])
+            section_title = topic_names.get(post.message_thread_id, f"Тема #{post.message_thread_id}")
+            return AutoDraftCreated(post.id, 0, parsed_faq.question_ru or "FAQ", section_title, 0, faq.is_active, TelegramContentTarget.FAQ, faq.id)
+
         parsed = self.parser.parse(source_text(post))
         complete = all((parsed.title_ru, parsed.text_ru, parsed.title_kk, parsed.text_kk))
         if parsed.kind != TelegramContentParseKind.BILINGUAL or parsed.confidence != TelegramContentConfidence.HIGH or not complete:
@@ -149,13 +190,22 @@ async def _notify_created(bot: Bot, session: AsyncSession, settings: Settings, r
     admins = list((await session.scalars(select(Admin).where(Admin.is_active.is_(True)))).all())
     recipients = {item.telegram_id for item in admins if Permission.CONTENT in ROLE_PERMISSIONS.get(item.role, set())}
     recipients.add(settings.super_admin_id)
+    target_button = InlineKeyboardButton(
+        text="❓ Открыть FAQ",
+        callback_data=FAQCallback(action="open", item_id=result.faq_id or 0).pack(),
+    ) if result.content_target == TelegramContentTarget.FAQ else InlineKeyboardButton(
+        text="👁 Открыть страницу" if result.published else "📄 Открыть черновик",
+        callback_data=AdminPageCallback(action="open", page_id=result.page_id).pack(),
+    )
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 Открыть страницу" if result.published else "📄 Открыть черновик", callback_data=AdminPageCallback(action="open", page_id=result.page_id).pack())],
+        [target_button],
         [InlineKeyboardButton(text="📥 Исходная публикация", callback_data=ChannelPostCallback(action="open", item_id=result.source_post_id).pack())],
     ])
     for recipient in recipients:
         try:
-            if result.published:
+            if result.content_target == TelegramContentTarget.FAQ:
+                text = ("🚀 <b>FAQ автоматически опубликован</b>" if result.published else "📝 <b>Создан черновик FAQ</b>") + f"\n\n❓ {html_text(text_preview(result.title, 120))}"
+            elif result.published:
                 text = (
                     "🚀 <b>Автоматически опубликовано</b>\n\n"
                     f"📂 Раздел: {html_text(result.section_title)}\n"

@@ -63,3 +63,8 @@ class TelegramFileSyncMode(StrEnum):
     OFF = "OFF"
     REVIEW = "REVIEW"
     AUTO = "AUTO"
+
+
+class TelegramContentTarget(StrEnum):
+    PAGE = "PAGE"
+    FAQ = "FAQ"

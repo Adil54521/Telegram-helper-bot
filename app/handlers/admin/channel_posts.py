@@ -11,8 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.service import AIService
 from app.callbacks import AdminMenuCallback, ChannelPostCallback
 from app.config import Settings
-from app.database.models import AuditLog, BotPage, BotPageRevision, PageAttachment, TelegramAttachmentReplacement, TelegramContentPost, TelegramEditPending, TelegramTopicPageMapping
-from app.database.models.enums import LanguageCode, MediaType, TelegramContentStatus, TelegramEditSyncMode, TelegramFileSyncMode, TelegramProcessingMode
+from app.database.models import AuditLog, BotPage, BotPageRevision, FAQItem, PageAttachment, TelegramAttachmentReplacement, TelegramContentPost, TelegramEditPending, TelegramFAQEditPending, TelegramTopicPageMapping
+from app.database.models.enums import LanguageCode, MediaType, TelegramContentStatus, TelegramContentTarget, TelegramEditSyncMode, TelegramFileSyncMode, TelegramProcessingMode
 from app.database.repositories.channel_posts import TelegramContentRepository
 from app.database.repositories.pages import PageRepository
 from app.database.repositories.telegram_auto_drafts import TelegramAutoDraftRepository
@@ -25,13 +25,17 @@ from app.services.telegram_content_parser import (
     TelegramContentParseKind,
     TelegramContentParser,
 )
+from app.services.telegram_faq_parser import TelegramFAQParser
 from app.services.telegram_edit_sync import TelegramEditSyncService
+from app.services.telegram_faq_edit_sync import TelegramFAQEditSyncService
+from app.services.faq_revisions import faq_snapshot
 from app.services.telegram_attachment_sync import TelegramAttachmentSyncService
 from app.services.telegram_publication_grouper import (
     PublicationGroupingResult,
     SelectedPublicationMaterial,
     TelegramPublicationGrouper,
 )
+from app.services.knowledge_sync import queue_faq_knowledge_sync
 from app.services.permissions import Permission, PermissionService
 from app.states.admin import ModerateChannelPost
 from app.utils.presentation import html_text, text_preview
@@ -51,6 +55,7 @@ DATA_KEYS = (
     "channel_material_source_id", "channel_materials",
 )
 CONTENT_PARSER = TelegramContentParser()
+FAQ_PARSER = TelegramFAQParser()
 
 
 def parse_post(post: TelegramContentPost) -> ParsedTelegramContent:
@@ -291,8 +296,9 @@ async def render_mappings(callback: CallbackQuery, session: AsyncSession, settin
     rows: list[list[InlineKeyboardButton]] = []
     for index, item in enumerate(rows_data, 1):
         label = topic_label(item.message_thread_id, item.topic_name)
-        lines.append(f"\n{'🟢' if item.is_active else '🔴'} {html_text(label)}\n↳ 📄 {html_text(item.parent_page_title)}\n⚙️ {mode_label(item.processing_mode)}")
-        rows.append([InlineKeyboardButton(text=f"{text_preview(label, 28)} → {text_preview(item.parent_page_title, 22)}", callback_data=cb("map_open", item.mapping_id))])
+        destination = "❓ FAQ" if item.content_target == TelegramContentTarget.FAQ else f"📄 {html_text(item.parent_page_title or '—')}"
+        lines.append(f"\n{'🟢' if item.is_active else '🔴'} {html_text(label)}\n↳ {destination}\n⚙️ {mode_label(item.processing_mode)}")
+        rows.append([InlineKeyboardButton(text=f"{text_preview(label, 28)} → {'FAQ' if item.content_target == TelegramContentTarget.FAQ else text_preview(item.parent_page_title or '—', 22)}", callback_data=cb("map_open", item.mapping_id))])
     if not rows_data:
         lines.append("\n\nСвязей пока нет.")
     rows.extend([[InlineKeyboardButton(text="➕ Добавить связь", callback_data=cb("map_add"))], [InlineKeyboardButton(text="⬅️ Назад", callback_data=cb("settings"))]])
@@ -352,6 +358,53 @@ async def edit_review_action(callback: CallbackQuery, callback_data: ChannelPost
     rows = [[InlineKeyboardButton(text="✅ Применить", callback_data=cb("edit_apply", pending.id))], [InlineKeyboardButton(text="🚫 Отклонить", callback_data=cb("edit_reject", pending.id))]]
     if callback.message:
         await safe_edit_text(callback.message, text, reply_markup=keyboard(rows))
+    await callback.answer()
+
+
+@router.callback_query(ChannelPostCallback.filter(F.action.in_({"faq_edit_open", "faq_edit_apply", "faq_edit_reject"})))
+async def faq_edit_review_action(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession) -> None:
+    pending = await session.get(TelegramFAQEditPending, callback_data.item_id)
+    if not pending:
+        return await callback.answer("Изменение FAQ не найдено", show_alert=True)
+    service = TelegramFAQEditSyncService(session, callback.from_user.id)
+    if callback_data.action == "faq_edit_apply":
+        try:
+            await service.apply_pending(pending.id)
+        except ValueError as error:
+            return await callback.answer(str(error), show_alert=True)
+        await callback.answer("FAQ обновлён")
+        if callback.message:
+            await safe_edit_text(callback.message, "✅ <b>Изменение FAQ применено</b>")
+        return
+    if callback_data.action == "faq_edit_reject":
+        try:
+            await service.reject_pending(pending.id)
+        except ValueError as error:
+            return await callback.answer(str(error), show_alert=True)
+        await callback.answer("Изменение отклонено")
+        if callback.message:
+            await safe_edit_text(callback.message, "🚫 <b>Изменение FAQ отклонено</b>")
+        return
+    faq = await session.get(FAQItem, pending.faq_id)
+    if not faq:
+        return await callback.answer("Связанный FAQ удалён", show_alert=True)
+    old = await faq_snapshot(session, faq)
+    text = (
+        "📝 <b>Изменение Telegram FAQ</b>\n\n"
+        f"❓ FAQ: {html_text(text_preview(old.question_ru, 120))}\n"
+        f"Статус: {html_text(pending.status)}\n\n"
+        f"🇷🇺 <b>Было:</b>\n{html_text(text_preview(old.answer_ru, 450))}\n\n"
+        f"🇷🇺 <b>Стало:</b>\n{html_text(text_preview(pending.answer_ru, 450))}\n\n"
+        f"🇰🇿 <b>Было:</b>\n{html_text(text_preview(old.answer_kk, 450))}\n\n"
+        f"🇰🇿 <b>Стало:</b>\n{html_text(text_preview(pending.answer_kk, 450))}"
+    )
+    rows = []
+    if pending.status == "REVIEW" and all((pending.question_ru, pending.answer_ru, pending.question_kk, pending.answer_kk)):
+        rows.append([InlineKeyboardButton(text="✅ Применить", callback_data=cb("faq_edit_apply", pending.id))])
+    if pending.status not in {"APPLIED", "REJECTED"}:
+        rows.append([InlineKeyboardButton(text="🚫 Отклонить", callback_data=cb("faq_edit_reject", pending.id))])
+    if callback.message:
+        await safe_edit_text(callback.message, text, reply_markup=keyboard(rows) if rows else None)
     await callback.answer()
 
 
@@ -471,7 +524,8 @@ async def mapping_select_page(callback: CallbackQuery, callback_data: ChannelPos
     topic_name = None
     if settings.content_chat_id is not None:
         topic_name = (await TelegramAutoDraftRepository(session).topic_names(settings.content_chat_id, [callback_data.item_id])).get(callback_data.item_id)
-    rows = [[InlineKeyboardButton(text=f"📄 {text_preview(page.draft_revision.title if page.draft_revision else page.key, 40)}", callback_data=cb("map_page", page.id, thread_id=callback_data.item_id))] for page in pages[:40]]
+    rows = [[InlineKeyboardButton(text=f"📄 {text_preview(page.draft_revision.title if page.draft_revision else page.key, 40)}", callback_data=cb("map_page", page.id, thread_id=callback_data.item_id))] for page in pages[:39]]
+    rows.append([InlineKeyboardButton(text="❓ Использовать Topic для FAQ", callback_data=cb("map_faq_confirm", thread_id=callback_data.item_id))])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=cb("map_add"))])
     if callback.message:
         await safe_edit_text(callback.message, f"📄 <b>Выберите страницу CMS</b>\n\nTelegram:\n{html_text(topic_label(callback_data.item_id, topic_name))}", reply_markup=keyboard(rows))
@@ -527,7 +581,43 @@ async def mapping_create(callback: CallbackQuery, callback_data: ChannelPostCall
     await render_mappings(callback, session, settings)
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action.in_({"map_open", "map_active", "map_attach", "map_delete", "map_delete_yes", "mode_manual", "mode_draft", "mode_publish_ask", "mode_publish_yes", "edit_off", "edit_review", "edit_auto_ask", "edit_auto_yes", "file_off", "file_review", "file_auto_ask", "file_auto_yes"})))
+@router.callback_query(ChannelPostCallback.filter(F.action == "map_faq_confirm"))
+async def mapping_create_faq(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
+    if settings.content_chat_id is None or callback_data.thread_id <= 0:
+        return await callback.answer("Некорректный Topic", show_alert=True)
+    repo = TelegramAutoDraftRepository(session)
+    if await repo.mapping(settings.content_chat_id, callback_data.thread_id):
+        return await callback.answer("Связь уже существует", show_alert=True)
+    item = TelegramTopicPageMapping(
+        chat_id=settings.content_chat_id, message_thread_id=callback_data.thread_id,
+        parent_page_id=None, content_target=TelegramContentTarget.FAQ,
+        processing_mode=TelegramProcessingMode.AUTO_DRAFT,
+        processing_mode_enabled_at=datetime.now(timezone.utc), auto_draft_enabled=True,
+        created_by=callback.from_user.id, updated_by=callback.from_user.id,
+    )
+    session.add(item)
+    await session.flush()
+    session.add(AuditLog(admin_id=callback.from_user.id, action="TELEGRAM_TOPIC_MAPPING_CREATED", entity_type="TelegramTopicPageMapping", entity_id=str(item.id), new_data={"chat_id": item.chat_id, "message_thread_id": item.message_thread_id, "content_target": "FAQ"}))
+    await render_mappings(callback, session, settings)
+
+
+@router.callback_query(ChannelPostCallback.filter(F.action == "target_page_pick"))
+async def mapping_target_page_pick(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
+    item = await session.get(TelegramTopicPageMapping, callback_data.item_id)
+    page = await PageRepository(session).by_id(callback_data.thread_id)
+    if not item or item.chat_id != settings.content_chat_id or not page or not page.is_active:
+        return await callback.answer("Связь или страница недоступна", show_alert=True)
+    await TelegramAutoDraftRepository(session).cancel_pending_for_topic(item.chat_id, item.message_thread_id)
+    old_target = item.content_target
+    item.parent_page_id = page.id
+    item.content_target = TelegramContentTarget.PAGE
+    item.processing_mode_enabled_at = datetime.now(timezone.utc)
+    item.updated_by = callback.from_user.id
+    session.add(AuditLog(admin_id=callback.from_user.id, action="TELEGRAM_TOPIC_TARGET_CHANGED", entity_type="TelegramTopicPageMapping", entity_id=str(item.id), old_data={"target": old_target.value}, new_data={"target": "PAGE", "parent_page_id": page.id}))
+    await render_mappings(callback, session, settings)
+
+
+@router.callback_query(ChannelPostCallback.filter(F.action.in_({"map_open", "map_active", "map_attach", "map_delete", "map_delete_yes", "mode_manual", "mode_draft", "mode_publish_ask", "mode_publish_yes", "edit_off", "edit_review", "edit_auto_ask", "edit_auto_yes", "file_off", "file_review", "file_auto_ask", "file_auto_yes", "target_page", "target_faq"})))
 async def mapping_action(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
     item = await session.get(TelegramTopicPageMapping, callback_data.item_id)
     if not item or item.chat_id != settings.content_chat_id:
@@ -550,7 +640,7 @@ async def mapping_action(callback: CallbackQuery, callback_data: ChannelPostCall
         if callback.message:
             await safe_edit_text(
                 callback.message,
-                "⚠️ <b>Автоматическая синхронизация изменений</b>\n\nРедактирование исходного Telegram-сообщения сможет создать и опубликовать новую ревизию связанной страницы.\n\nПри обнаружении ручных CMS-изменений автопубликация будет заблокирована.",
+                "⚠️ <b>Автоматическая синхронизация изменений</b>\n\nРедактирование исходного Telegram-сообщения создаст новую безопасную ревизию связанного объекта.\n\nПри обнаружении ручных CMS-изменений автоматическое применение будет заблокировано.",
                 reply_markup=keyboard([[InlineKeyboardButton(text="✅ Включить", callback_data=cb("edit_auto_yes", item.id))], [InlineKeyboardButton(text="❌ Отмена", callback_data=cb("map_open", item.id))]]),
             )
         await callback.answer()
@@ -582,6 +672,23 @@ async def mapping_action(callback: CallbackQuery, callback_data: ChannelPostCall
             if new_mode == TelegramProcessingMode.AUTO_PUBLISH:
                 session.add(AuditLog(admin_id=callback.from_user.id, action="TELEGRAM_AUTO_PUBLISH_ENABLED", entity_type="TelegramTopicPageMapping", entity_id=str(item.id), old_data={"mode": old_mode.value}, new_data={"mode": new_mode.value}))
             session.add(AuditLog(admin_id=callback.from_user.id, action="TELEGRAM_TOPIC_MAPPING_UPDATED", entity_type="TelegramTopicPageMapping", entity_id=str(item.id), old_data={"processing_mode": old_mode.value}, new_data={"processing_mode": new_mode.value}))
+    if callback_data.action in {"target_page", "target_faq"}:
+        new_target = TelegramContentTarget.PAGE if callback_data.action == "target_page" else TelegramContentTarget.FAQ
+        if new_target == TelegramContentTarget.PAGE and item.parent_page_id is None:
+            pages = [page for page in await PageRepository(session).all() if page.is_active]
+            rows = [[InlineKeyboardButton(text=f"📄 {text_preview(page.draft_revision.title if page.draft_revision else page.key, 40)}", callback_data=cb("target_page_pick", item.id, thread_id=page.id))] for page in pages[:40]]
+            rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data=cb("map_open", item.id))])
+            if callback.message:
+                await safe_edit_text(callback.message, "📄 <b>Выберите родительскую страницу</b>", reply_markup=keyboard(rows))
+            await callback.answer()
+            return
+        if item.content_target != new_target:
+            await TelegramAutoDraftRepository(session).cancel_pending_for_topic(item.chat_id, item.message_thread_id)
+            old_target = item.content_target
+            item.content_target = new_target
+            item.processing_mode_enabled_at = datetime.now(timezone.utc)
+            item.updated_by = callback.from_user.id
+            session.add(AuditLog(admin_id=callback.from_user.id, action="TELEGRAM_TOPIC_TARGET_CHANGED", entity_type="TelegramTopicPageMapping", entity_id=str(item.id), old_data={"target": old_target.value}, new_data={"target": new_target.value}))
     if callback_data.action in {"edit_off", "edit_review", "edit_auto_yes"}:
         new_edit_mode = {
             "edit_off": TelegramEditSyncMode.OFF,
@@ -616,7 +723,7 @@ async def mapping_action(callback: CallbackQuery, callback_data: ChannelPostCall
         field = {"map_active": "is_active", "map_attach": "auto_attach_materials"}[callback_data.action]
         old = getattr(item, field); setattr(item, field, not old); item.updated_by = callback.from_user.id
         session.add(AuditLog(admin_id=callback.from_user.id, action="TELEGRAM_TOPIC_MAPPING_UPDATED", entity_type="TelegramTopicPageMapping", entity_id=str(item.id), old_data={field: old}, new_data={field: getattr(item, field)}))
-    page = await PageRepository(session).by_id(item.parent_page_id)
+    page = await PageRepository(session).by_id(item.parent_page_id) if item.parent_page_id else None
     title = page.draft_revision.title if page and page.draft_revision else "—"
     import_config = await TelegramAutoDraftRepository(session).settings(item.chat_id)
     settle_seconds = import_config.settle_seconds if import_config else 60
@@ -626,8 +733,9 @@ async def mapping_action(callback: CallbackQuery, callback_data: ChannelPostCall
         text = f"⚠️ <b>Удалить связь «{html_text(label)}»?</b>\n\nCMS-страницы и уже созданные черновики удалены не будут."
         rows = [[InlineKeyboardButton(text="🔴 Да, удалить", callback_data=cb("map_delete_yes", item.id))], [InlineKeyboardButton(text="⬅️ Отмена", callback_data=cb("map_open", item.id))]]
     else:
-        text = f"📂 <b>{html_text(label)}</b>\n<code>thread #{item.message_thread_id}</code>\n\n→ 📄 {html_text(title)}\n\nСвязь: {'🟢 активна' if item.is_active else '🔴 выключена'}\n\n<b>Новые публикации:</b>\n{mode_label(item.processing_mode)}\n\n<b>Изменения текста:</b>\n{edit_mode_label(item.edit_sync_mode)}\n\n<b>Замена файлов:</b>\n{file_mode_label(item.file_sync_mode)}\n\n📎 Материалы: {'автоматически' if item.auto_attach_materials else 'не добавлять'}\n⏱ Ожидание: {settle_seconds} секунд"
-        rows = [[InlineKeyboardButton(text="👤 Ручной", callback_data=cb("mode_manual", item.id))], [InlineKeyboardButton(text="📝 Авточерновик", callback_data=cb("mode_draft", item.id))], [InlineKeyboardButton(text="🚀 Автопубликация", callback_data=cb("mode_publish_ask", item.id))], [InlineKeyboardButton(text="🔒 Текст: выключить", callback_data=cb("edit_off", item.id))], [InlineKeyboardButton(text="📝 Текст: на проверку", callback_data=cb("edit_review", item.id))], [InlineKeyboardButton(text="🔄 Текст: автоматически", callback_data=cb("edit_auto_ask", item.id))], [InlineKeyboardButton(text="🔒 Файлы: выключить", callback_data=cb("file_off", item.id))], [InlineKeyboardButton(text="📝 Файлы: на проверку", callback_data=cb("file_review", item.id))], [InlineKeyboardButton(text="🔄 Файлы: автоматически", callback_data=cb("file_auto_ask", item.id))], [InlineKeyboardButton(text="Переключить материалы", callback_data=cb("map_attach", item.id))], [InlineKeyboardButton(text="Включить/выключить связь", callback_data=cb("map_active", item.id))], [InlineKeyboardButton(text="🗑 Удалить связь", callback_data=cb("map_delete", item.id))], [InlineKeyboardButton(text="⬅️ Назад", callback_data=cb("maps"))]]
+        target_label = "❓ FAQ" if item.content_target == TelegramContentTarget.FAQ else f"📄 Страница: {html_text(title)}"
+        text = f"📂 <b>{html_text(label)}</b>\n<code>thread #{item.message_thread_id}</code>\n\n<b>Тип контента:</b>\n{target_label}\n\nСвязь: {'🟢 активна' if item.is_active else '🔴 выключена'}\n\n<b>Обработка:</b>\n{mode_label(item.processing_mode)}\n\n<b>Изменения текста:</b>\n{edit_mode_label(item.edit_sync_mode)}\n\n<b>Замена файлов:</b>\n{file_mode_label(item.file_sync_mode)}\n\n📎 Материалы: {'автоматически' if item.auto_attach_materials else 'не добавлять'}\n⏱ Ожидание: {settle_seconds} секунд"
+        rows = [[InlineKeyboardButton(text="📄 Страницы", callback_data=cb("target_page", item.id)), InlineKeyboardButton(text="❓ FAQ", callback_data=cb("target_faq", item.id))], [InlineKeyboardButton(text="👤 Ручной", callback_data=cb("mode_manual", item.id))], [InlineKeyboardButton(text="📝 Авточерновик", callback_data=cb("mode_draft", item.id))], [InlineKeyboardButton(text="🚀 Автопубликация", callback_data=cb("mode_publish_ask", item.id))], [InlineKeyboardButton(text="🔒 Текст: выключить", callback_data=cb("edit_off", item.id))], [InlineKeyboardButton(text="📝 Текст: на проверку", callback_data=cb("edit_review", item.id))], [InlineKeyboardButton(text="🔄 Текст: автоматически", callback_data=cb("edit_auto_ask", item.id))], [InlineKeyboardButton(text="🔒 Файлы: выключить", callback_data=cb("file_off", item.id))], [InlineKeyboardButton(text="📝 Файлы: на проверку", callback_data=cb("file_review", item.id))], [InlineKeyboardButton(text="🔄 Файлы: автоматически", callback_data=cb("file_auto_ask", item.id))], [InlineKeyboardButton(text="Переключить материалы", callback_data=cb("map_attach", item.id))], [InlineKeyboardButton(text="Включить/выключить связь", callback_data=cb("map_active", item.id))], [InlineKeyboardButton(text="🗑 Удалить связь", callback_data=cb("map_delete", item.id))], [InlineKeyboardButton(text="⬅️ Назад", callback_data=cb("maps"))]]
     if callback.message:
         await safe_edit_text(callback.message, text, reply_markup=keyboard(rows))
     await callback.answer()
@@ -638,6 +746,7 @@ def post_card(
     page: int,
     filter_: str,
     grouping: PublicationGroupingResult | None = None,
+    faq_parsed=None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     value = source_text(post)
     parsed = parse_post(post)
@@ -658,12 +767,25 @@ def post_card(
             + "\n".join(material_lines)
             + "\n"
         )
+    parsed_block = parsed_preview(parsed)
+    heading = "📥 <b>Telegram-публикация</b>"
+    if faq_parsed is not None:
+        heading = "❓ <b>Telegram FAQ</b>"
+        confidence = "высокая" if faq_parsed.confidence == TelegramContentConfidence.HIGH else "низкая"
+        parsed_block = (
+            f"🔎 {'RU + KK распознаны' if faq_parsed.is_complete else html_text(faq_parsed.diagnostic)}\n"
+            f"Уверенность: {confidence}\n\n"
+            f"🇰🇿 <b>Сұрақ:</b>\n{html_text(faq_parsed.question_kk or '—')}\n\n"
+            f"🇰🇿 <b>Жауап:</b>\n{html_text(text_preview(faq_parsed.answer_kk, 300))}\n\n"
+            f"🇷🇺 <b>Вопрос:</b>\n{html_text(faq_parsed.question_ru or '—')}\n\n"
+            f"🇷🇺 <b>Ответ:</b>\n{html_text(text_preview(faq_parsed.answer_ru, 300))}"
+        )
     text = (
-        "📥 <b>Telegram-публикация</b>\n\n"
+        heading + "\n\n"
         f"📅 {local.strftime('%d.%m.%Y %H:%M') if local else '—'}\n\n"
         + (f"🧵 Topic/thread: {post.message_thread_id}\n\n" if post.message_thread_id is not None else "")
         +
-        f"{parsed_preview(parsed)}\n\n"
+        f"{parsed_block}\n\n"
         f"📝 <b>Исходный текст:</b>\n{html_text(text_preview(value, 450)) if value else '—'}\n\n"
         f"📎 В самой публикации: {len(post.media)}{warning}\n"
         + grouping_summary
@@ -705,7 +827,9 @@ async def open_post(callback: CallbackQuery, callback_data: ChannelPostCallback,
         await callback.answer("Публикация не найдена", show_alert=True)
         return
     grouping = await group_post(post, session)
-    text, markup = post_card(post, callback_data.page, callback_data.status, grouping)
+    mapping = await TelegramAutoDraftRepository(session).mapping(post.chat_id, post.message_thread_id) if post.message_thread_id is not None else None
+    faq_parsed = FAQ_PARSER.parse(source_text(post)) if mapping and mapping.content_target == TelegramContentTarget.FAQ else None
+    text, markup = post_card(post, callback_data.page, callback_data.status, grouping, faq_parsed)
     if callback.message:
         await safe_edit_text(callback.message, text, reply_markup=markup)
     await callback.answer()
@@ -943,7 +1067,13 @@ async def prepare_manual(callback: CallbackQuery, callback_data: ChannelPostCall
                 channel_text_kk=parsed.text_kk,
             )
     else:
-        common.update(channel_question_ru=title, channel_answer_ru=value, channel_question_kk=None, channel_answer_kk=None)
+        faq = FAQ_PARSER.parse(value)
+        common.update(
+            channel_question_ru=faq.question_ru or "",
+            channel_answer_ru=faq.answer_ru or "",
+            channel_question_kk=faq.question_kk or "",
+            channel_answer_kk=faq.answer_kk or "",
+        )
     await state.update_data(**common)
     await show_draft(callback, state)
     await callback.answer()
@@ -1104,7 +1234,9 @@ async def create_draft(callback: CallbackQuery, callback_data: ChannelPostCallba
             )
             await service.create_page(item_id, settings.content_chat_id, callback.from_user.id, title_ru=data["channel_title_ru"], text_ru=data["channel_text_ru"], title_kk=data.get("channel_title_kk"), text_kk=data.get("channel_text_kk"), materials=selected_materials)
         else:
-            await service.create_faq(item_id, settings.content_chat_id, callback.from_user.id, question_ru=data["channel_question_ru"], answer_ru=data["channel_answer_ru"], question_kk=data.get("channel_question_kk"), answer_kk=data.get("channel_answer_kk"))
+            faq = await service.create_faq(item_id, settings.content_chat_id, callback.from_user.id, question_ru=data["channel_question_ru"], answer_ru=data["channel_answer_ru"], question_kk=data.get("channel_question_kk"), answer_kk=data.get("channel_answer_kk"))
+            session.add(AuditLog(admin_id=callback.from_user.id, action="TELEGRAM_FAQ_MANUALLY_CREATED", entity_type="FAQItem", entity_id=str(faq.id), new_data={"source_post_id": item_id}))
+            await queue_faq_knowledge_sync(session, faq.id, callback.from_user.id)
     except ValueError as error:
         await callback.answer(str(error), show_alert=True); return
     await finish_wizard(state, *DATA_KEYS, "channel_media_count")

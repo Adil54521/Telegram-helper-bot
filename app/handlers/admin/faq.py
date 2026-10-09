@@ -5,6 +5,7 @@ from datetime import date
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.callbacks import AdminMenuCallback, FAQCallback
@@ -13,6 +14,7 @@ from app.ai.service import AIService
 from app.database.repositories.cms import CMSRepository
 from app.database.repositories.users import upsert_user
 from app.database.models.enums import LanguageCode
+from app.database.models import FAQRevision
 from app.services.cms import FAQService
 from app.services.permissions import Permission, PermissionService
 from app.states.admin import AddFAQ, EditFAQ, ImportFAQ
@@ -62,7 +64,7 @@ async def open_(cb:CallbackQuery,callback_data:FAQCallback,session:AsyncSession,
     if cb.message:await safe_edit_text(cb.message,card,reply_markup=markup);await cb.answer()
 
 def faq_card(x,page=0):
-    rows=[[InlineKeyboardButton(text="🇷🇺 Редактировать RU",callback_data=FAQCallback(action="edit_q_ru",item_id=x.id,page=page).pack()),InlineKeyboardButton(text="🇰🇿 Редактировать KK",callback_data=FAQCallback(action="edit_q_kk",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="🇷🇺 Изменить ответ",callback_data=FAQCallback(action="edit_a_ru",item_id=x.id,page=page).pack()),InlineKeyboardButton(text="🇰🇿 Жауапты өзгерту",callback_data=FAQCallback(action="edit_a_kk",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="⬆️ Выше",callback_data=FAQCallback(action="up",item_id=x.id,page=page).pack()),InlineKeyboardButton(text="⬇️ Ниже",callback_data=FAQCallback(action="down",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="🔴 Выключить" if x.is_active else "🟢 Включить",callback_data=FAQCallback(action="toggle",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="🗑 Удалить",callback_data=FAQCallback(action="delete_ask",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=FAQCallback(action="list",page=page).pack())]]
+    rows=[[InlineKeyboardButton(text="🇷🇺 Редактировать RU",callback_data=FAQCallback(action="edit_q_ru",item_id=x.id,page=page).pack()),InlineKeyboardButton(text="🇰🇿 Редактировать KK",callback_data=FAQCallback(action="edit_q_kk",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="🇷🇺 Изменить ответ",callback_data=FAQCallback(action="edit_a_ru",item_id=x.id,page=page).pack()),InlineKeyboardButton(text="🇰🇿 Жауапты өзгерту",callback_data=FAQCallback(action="edit_a_kk",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="⬆️ Выше",callback_data=FAQCallback(action="up",item_id=x.id,page=page).pack()),InlineKeyboardButton(text="⬇️ Ниже",callback_data=FAQCallback(action="down",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="🔴 Выключить" if x.is_active else "🟢 Включить",callback_data=FAQCallback(action="toggle",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="📜 История изменений",callback_data=FAQCallback(action="history",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="🗑 Удалить",callback_data=FAQCallback(action="delete_ask",item_id=x.id,page=page).pack())],[InlineKeyboardButton(text="⬅️ Назад",callback_data=FAQCallback(action="list",page=page).pack())]]
     ru=next((v for v in x.translations if v.language_code==LanguageCode.RU),None);kk=next((v for v in x.translations if v.language_code==LanguageCode.KK),None)
     ru_q,ru_a=(ru.question,ru.answer) if ru else (x.question,x.answer)
     if not kk:
@@ -70,6 +72,29 @@ def faq_card(x,page=0):
     kk_block=(f"<b>Сұрақ:</b>\n{html_text(kk.question)}\n\n<b>Жауап:</b>\n{html_text(text_preview(kk.answer))}" if kk else "Перевод отсутствует")
     card=(f"❓ <b>FAQ</b>\n\n{'🟢 Активен' if x.is_active else '🔴 Выключен'}\n\n🇷🇺 <b>Русский</b>\n\n<b>Вопрос:</b>\n{html_text(ru_q)}\n\n<b>Ответ:</b>\n{html_text(text_preview(ru_a))}\n\n🇰🇿 <b>Қазақша{' ⚠️' if not kk else ''}</b>\n\n{kk_block}\n\n📍 Позиция: {x.position+1}")
     return card,kb(rows)
+
+
+@router.callback_query(FAQCallback.filter(F.action == "history"))
+async def faq_history(cb: CallbackQuery, callback_data: FAQCallback, session: AsyncSession, settings: Settings) -> None:
+    if not await guard(cb, session, settings): return
+    item = await CMSRepository(session).faq(callback_data.item_id)
+    if not item: return await cb.answer("FAQ не найден", show_alert=True)
+    revisions = list((await session.scalars(
+        select(FAQRevision).where(FAQRevision.faq_id == item.id).order_by(FAQRevision.version.desc()).limit(8)
+    )).all())
+    body = []
+    for revision in revisions:
+        created = revision.created_at.astimezone().strftime("%d.%m.%Y %H:%M") if revision.created_at else "—"
+        actor = str(revision.created_by) if revision.created_by else "система"
+        body.append(
+            f"<b>v{revision.version}</b> · {created}\n"
+            f"Источник: {'Telegram' if revision.source_type == 'TELEGRAM' else 'CMS'} · {html_text(actor)}\n"
+            f"🇷🇺 {html_text(text_preview(revision.question_ru, 70))}\n"
+            f"🇰🇿 {html_text(text_preview(revision.question_kk, 70))}"
+        )
+    text = "📜 <b>История изменений FAQ</b>\n\n" + ("\n\n".join(body) if body else "История пока пуста.")
+    await safe_edit_text(cb.message, text, reply_markup=kb([[InlineKeyboardButton(text="⬅️ К FAQ",callback_data=FAQCallback(action="open",item_id=item.id,page=callback_data.page).pack())]]))
+    await cb.answer()
 
 
 @router.callback_query(FAQCallback.filter(F.action == "template"))
