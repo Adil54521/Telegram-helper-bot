@@ -197,7 +197,7 @@ def page_keyboard(
         result.append([InlineKeyboardButton(text=f"📎 {t('materials', language)} ({attachment_count})", callback_data=UserAttachmentCallback(action="list", page_id=page_id).pack())])
 
     if page_key == "main" and ai_available:
-        result.append([InlineKeyboardButton(text=t("ask_ai", language), callback_data=UserAICallback(action="ask").pack())])
+        result.insert(1, [InlineKeyboardButton(text=t("ask_ai", language), callback_data=UserAICallback(action="ask").pack())])
 
     # Системная кнопка смены языка.
     result.append(
