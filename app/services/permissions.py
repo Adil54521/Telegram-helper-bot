@@ -14,11 +14,13 @@ class Permission(StrEnum):
     BROADCAST = "BROADCAST"
     STATISTICS = "STATISTICS"
     ADMINS = "ADMINS"
+    AI_HISTORY_VIEW = "AI_HISTORY_VIEW"
+    AI_HISTORY_EXPORT = "AI_HISTORY_EXPORT"
 
 
 ROLE_PERMISSIONS = {
     AdminRole.SUPER_ADMIN: set(Permission),
-    AdminRole.ADMIN: {Permission.CONTENT, Permission.FAQ, Permission.BROADCAST, Permission.STATISTICS},
+    AdminRole.ADMIN: {Permission.CONTENT, Permission.FAQ, Permission.BROADCAST, Permission.STATISTICS, Permission.AI_HISTORY_VIEW, Permission.AI_HISTORY_EXPORT},
     AdminRole.EDITOR: {Permission.CONTENT, Permission.FAQ},
 }
 

@@ -20,3 +20,12 @@ def paginate(items: Sequence[T], page: int, page_size: int = PAGE_SIZE) -> PageS
     current = max(0, min(page, pages - 1))
     start = current * page_size
     return PageSlice(list(items[start:start + page_size]), current, pages, total)
+
+def paginate_count(total: int, page: int, page_size: int = PAGE_SIZE) -> tuple[int, int]:
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    pages = max(1, ceil(total / page_size))
+    current = max(0, min(page, pages - 1))
+
+    return current, pages

@@ -22,6 +22,7 @@ from app.filters.admin import HasPermission
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_ai")
+
 router.callback_query.filter(HasPermission(Permission.STATISTICS))
 router.message.filter(HasPermission(Permission.STATISTICS))
 def ai_keyboard() -> InlineKeyboardMarkup:
@@ -31,6 +32,7 @@ def ai_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔎 Проверить поиск", callback_data=AdminAICallback(action="search").pack())],
             [InlineKeyboardButton(text="📚 Индекс знаний", callback_data=AdminAICallback(action="index").pack())],
             [InlineKeyboardButton(text="📊 Аналитика", callback_data=AdminAICallback(action="analytics_today").pack())],
+            [InlineKeyboardButton(text="📜 История вопросов", callback_data=AdminAICallback(action="history").pack())],
             [InlineKeyboardButton(text="⬅️ Панель", callback_data=AdminMenuCallback(section="dashboard").pack())],
         ]
     )

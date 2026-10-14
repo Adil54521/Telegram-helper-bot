@@ -84,3 +84,8 @@ class ChannelPostCallback(CallbackData, prefix="ch"):
     page: int = 0
     status: str = "NEW"
     thread_id: int = 0
+
+class UserAIHistoryCallback(CallbackData, prefix="aih"):
+    action: str
+    page: int = 0
+    item_id: int = 0
