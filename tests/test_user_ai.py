@@ -31,6 +31,8 @@ class UserAITests(unittest.IsolatedAsyncioTestCase):
 
         self.settings = SimpleNamespace(ai_available=True)
         self.state = MagicMock()
+        self.state.get_data = AsyncMock(return_value={})
+        self.state.update_data = AsyncMock()
         self.ai_service = MagicMock()
         self.ai_service.answer = AsyncMock()
 

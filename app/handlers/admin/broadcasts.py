@@ -19,13 +19,13 @@ from app.utils.wizard import consume_input, edit_wizard, finish_wizard, remember
 from app.utils.pagination import paginate
 from app.filters.admin import HasPermission
 router=Router(name="broadcasts");SIZE=8
-router.callback_query.filter(HasPermission(Permission.BROADCAST))
-router.message.filter(HasPermission(Permission.BROADCAST))
+router.callback_query.filter(HasPermission(Permission.BROADCAST_MANAGE))
+router.message.filter(HasPermission(Permission.BROADCAST_MANAGE))
 logger=logging.getLogger(__name__)
 _confirm_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 MAX_BROADCAST_PHOTO_BYTES = 20_000_000
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
-async def ok(uid,s,c):return await PermissionService(s,c).has(uid,Permission.BROADCAST)
+async def ok(uid,s,c):return await PermissionService(s,c).has(uid,Permission.BROADCAST_MANAGE)
 async def guard(cb,s,c):
     if await ok(cb.from_user.id,s,c):return True
     await cb.answer("Доступ запрещён",show_alert=True);return False

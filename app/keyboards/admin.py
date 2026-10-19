@@ -10,16 +10,44 @@ from app.database.models.enums import AdminRole
 def dashboard(role: AdminRole) -> InlineKeyboardMarkup:
     allowed = ROLE_PERMISSIONS[role]
     definitions = [
-        (Permission.CONTENT, "📄 Страницы", "pages"),
-        (Permission.CONTENT, "🔘 Меню и кнопки", "buttons"),
-        (Permission.CONTENT, "📥 Telegram-публикации", "channel_posts"),
-        (Permission.FAQ, "❓ FAQ", "faq"),
-        (Permission.BROADCAST, "📢 Рассылка", "broadcasts"),
-        (Permission.ADMINS, "👥 Администраторы", "admins"),
-        (Permission.STATISTICS, "📊 Статистика", "statistics"),
-        (Permission.STATISTICS, "🤖 ИИ-ассистент", "ai"),
+        (Permission.CONTENT_VIEW, "📄 Страницы", "pages"),
+        (Permission.CONTENT_MANAGE, "🔘 Меню и кнопки", "buttons"),
+        (Permission.CONTENT_VIEW, "📥 Telegram-публикации", "channel_posts"),
+        (Permission.FAQ_MANAGE, "❓ FAQ", "faq"),
+        (Permission.BROADCAST_MANAGE, "📢 Рассылка", "broadcasts"),
+        (Permission.ADMINS_MANAGE, "👥 Администраторы", "admins"),
+        (Permission.STATISTICS_VIEW, "📊 Статистика", "statistics"),
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data=AdminMenuCallback(section=section).pack())] for permission, label, section in definitions if permission in allowed])
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=label,
+                callback_data=AdminMenuCallback(
+                    section=section
+                ).pack(),
+            )
+        ]
+        for permission, label, section in definitions
+        if permission in allowed
+    ]
+
+    if allowed.intersection({
+        Permission.AI_ANALYTICS_VIEW,
+        Permission.AI_DIAGNOSTICS,
+        Permission.AI_HISTORY_VIEW,
+        Permission.AI_INDEX_SYNC,
+    }):
+        rows.append([
+            InlineKeyboardButton(
+                text="🤖 ИИ-ассистент",
+                callback_data=AdminMenuCallback(
+                    section="ai"
+                ).pack(),
+            )
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def pages_list(pages: list[BotPage], current: int = 0) -> InlineKeyboardMarkup:

@@ -1,6 +1,7 @@
 import logging
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.chat_action import ChatActionSender
@@ -21,20 +22,143 @@ from app.utils.pagination import paginate_count
 
 logger = logging.getLogger(__name__)
 router = Router(name="user_ai")
-def cancel_keyboard(language: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=t("my_questions", language), callback_data=UserAIHistoryCallback(action="list").pack())],
-                [InlineKeyboardButton(text=t("cancel", language), callback_data=UserAICallback(action="cancel").pack())],
-            ]
-        )
-
-
-def finish_keyboard(language: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=t("my_questions", language), callback_data=UserAIHistoryCallback(action="list").pack())],
-            [InlineKeyboardButton(text=t("finish_ai", language), callback_data=UserAICallback(action="finish").pack())],
+def ai_dialog_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=t("my_questions", language),
+                    callback_data=UserAIHistoryCallback(
+                        action="list"
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=t("finish_ai", language),
+                    callback_data=UserAICallback(
+                        action="finish"
+                    ).pack(),
+                )
+            ],
         ]
     )
+
+
+async def send_ai_response(
+    message: Message,
+    state: FSMContext,
+    text: str,
+    language: str,
+) -> Message:
+    # 1. Отправляем новый ответ с клавиатурой.
+    sent = await message.answer(
+        text,
+        reply_markup=ai_dialog_keyboard(language),
+    )
+
+    # 2. Получаем ID предыдущего сообщения.
+    data = await state.get_data()
+    previous_id = data.get("ai_control_message_id")
+    previous_chat_id = data.get("ai_control_chat_id")
+
+    # 3. Запоминаем новое сообщение.
+    await state.update_data(
+        ai_control_message_id=sent.message_id,
+        ai_control_chat_id=sent.chat.id,
+    )
+
+    # 4. Убираем кнопки у предыдущего сообщения.
+    if (
+        previous_id is not None
+        and previous_chat_id == sent.chat.id
+        and previous_id != sent.message_id
+    ):
+        try:
+            await message.bot.edit_message_reply_markup(
+                chat_id=previous_chat_id,
+                message_id=previous_id,
+                reply_markup=None,
+            )
+        except TelegramAPIError as error:
+            logger.warning(
+                "Failed to remove old AI keyboard "
+                "chat_id=%s message_id=%s error=%s",
+                previous_chat_id,
+                previous_id,
+                type(error).__name__,
+            )
+
+    return sent
+
+
+async def show_ai_history(
+    callback: CallbackQuery,
+    state: FSMContext,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    if not callback.message:
+        return
+
+    data = await state.get_data()
+
+    history_message_id = data.get(
+        "ai_history_message_id"
+    )
+    history_chat_id = data.get(
+        "ai_history_chat_id"
+    )
+
+    current_chat_id = callback.message.chat.id
+
+    # Если пользователь нажал кнопку внутри
+    # уже открытой истории, редактируем её.
+    if (
+        history_message_id == callback.message.message_id
+        and history_chat_id == current_chat_id
+    ):
+        await safe_edit_text(
+            callback.message,
+            text,
+            reply_markup=reply_markup,
+        )
+        return
+
+    # Если история уже была открыта,
+    # пробуем обновить существующее сообщение.
+    if (
+        history_message_id is not None
+        and history_chat_id == current_chat_id
+    ):
+        try:
+            await callback.bot.edit_message_text(
+                text,
+                chat_id=current_chat_id,
+                message_id=history_message_id,
+                reply_markup=reply_markup,
+            )
+            return
+        except TelegramAPIError:
+            logger.warning(
+                "Failed to update AI history message "
+                "chat_id=%s message_id=%s",
+                current_chat_id,
+                history_message_id,
+            )
+
+    # Если истории ещё нет, создаём сообщение.
+    sent = await callback.message.answer(
+        text,
+        reply_markup=reply_markup,
+    )
+
+    await state.update_data(
+        ai_history_message_id=sent.message_id,
+        ai_history_chat_id=sent.chat.id,
+    )
+
+
 
 MY_QUESTIONS_PAGE_SIZE = 5
 
@@ -93,8 +217,16 @@ def my_questions_keyboard(records: list, page: int, pages: int, language: str) -
 
 async def leave_ai_state(state: FSMContext) -> None:
     data = await state.get_data()
-    for key in ("last_question",):
+
+    for key in (
+        "last_question",
+        "ai_control_message_id",
+        "ai_control_chat_id",
+        "ai_history_message_id",
+        "ai_history_chat_id",
+    ):
         data.pop(key, None)
+
     await state.set_data(data)
     await state.set_state(None)
 
@@ -103,20 +235,33 @@ async def leave_ai_state(state: FSMContext) -> None:
 async def begin_ai(callback: CallbackQuery, session: AsyncSession, settings: Settings, state: FSMContext, ai_service: AIService | None) -> None:
     user = await upsert_user(session, callback.from_user)
     language = normalize_language(user.content_language_code)
+
     if not settings.ai_available or ai_service is None:
-        await state.set_state(None)
-        return await callback.answer(t("ai_unavailable", language), show_alert=True)
+        await leave_ai_state(state)
+        await callback.answer(t("ai_unavailable", language), show_alert=True)
+        return
+    
+    await state.update_data(
+        ai_control_message_id=None,
+        ai_control_chat_id=None,
+        ai_history_message_id=None,
+        ai_history_chat_id=None,
+    )
+
     await state.set_state(AskAI.question)
-    if callback.message:
-        await callback.message.answer(t("ai_prompt", language), reply_markup=cancel_keyboard(language))
-    await callback.answer()
 
-
-@router.callback_query(UserAICallback.filter(F.action == "cancel"))
-async def cancel_ai(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
-    await leave_ai_state(state)
     if callback.message:
-        await safe_delete_message(callback.message)
+        await safe_edit_text(
+            callback.message,
+            t("ai_prompt", language),
+            reply_markup=ai_dialog_keyboard(language),
+        )
+
+        await state.update_data(
+            ai_control_message_id=callback.message.message_id,
+            ai_control_chat_id=callback.message.chat.id,
+        )
+
     await callback.answer()
 
 
@@ -147,12 +292,25 @@ async def answer_ai(message: Message, session: AsyncSession, settings: Settings,
     language = normalize_language(user.content_language_code)
     question = (message.text or "").strip()
     if not question:
-        return await message.answer(t("ai_text_only", language), reply_markup=finish_keyboard(language))
+        return await send_ai_response(
+            message,
+            state,
+            t("ai_text_only", language),
+            language,
+        )
+    
     if len(question) > MAX_QUESTION_LENGTH:
-        return await message.answer(t("ai_too_long", language), reply_markup=finish_keyboard(language))
+        return await send_ai_response(
+            message,
+            state,
+            t("ai_too_long", language),
+            language,
+        )
+    
     if not settings.ai_available or ai_service is None:
-        await state.set_state(None)
-        return await message.answer(t("ai_unavailable", language))
+        await leave_ai_state(state)
+        await message.answer(t("ai_unavailable", language))
+        return
 
     history = AIHistoryRepository(session)
     record = None
@@ -171,62 +329,106 @@ async def answer_ai(message: Message, session: AsyncSession, settings: Settings,
             await history.fail(record)
             record.status = "RATE_LIMITED"
         
-        await message.answer(t("ai_cooldown", language), reply_markup=finish_keyboard(language))
+        await send_ai_response(
+            message,
+            state,
+            t("ai_cooldown", language),
+            language,
+        )
         return
     except (AIProviderError, TimeoutError, OSError):
         if record:
             await history.fail(record)
 
-        await message.answer(t("ai_unavailable", language), reply_markup=finish_keyboard(language))
+        await send_ai_response(
+            message,
+            state,
+            t("ai_unavailable", language),
+            language,
+        )
         return
     except Exception:
-        logger.exception("Unexpected AI handler failure user_id=%s language=%s", message.from_user.id, language)
-        
+        logger.exception(
+            "Unexpected AI handler failure user_id=%s language=%s",
+            message.from_user.id,
+            language,
+        )
+
         if record:
             await history.fail(record)
 
-        await message.answer(t("ai_unavailable", language), reply_markup=finish_keyboard(language))
+        await send_ai_response(
+            message,
+            state,
+            t("ai_unavailable", language),
+            language,
+        )
         return
     
     if result is None:
         if record:
             await history.complete(record, None)
 
-        await message.answer(t("ai_no_info", language), reply_markup=finish_keyboard(language))
+        await send_ai_response(
+            message,
+            state,
+            t("ai_no_info", language),
+            language,
+        )
         return
     
     if record:
         await history.complete(record, result.text)
 
-    await message.answer(f"{html_text(result.text)}\n\n{t('ai_source', language)}", reply_markup=finish_keyboard(language))
+    await send_ai_response(
+        message,
+        state,
+        f"{html_text(result.text)}\n\n{t('ai_source', language)}",
+        language,
+    )
 
 
 @router.message(AskAI.question)
-async def ai_text_only(message: Message, session: AsyncSession) -> None:
+async def ai_text_only(message: Message, session: AsyncSession, state: FSMContext) -> None:
     if not message.from_user:
         return
+
     user = await upsert_user(session, message.from_user)
     language = normalize_language(user.content_language_code)
-    await message.answer(t("ai_text_only", language), reply_markup=finish_keyboard(language))
+
+    await send_ai_response(
+        message,
+        state,
+        t("ai_text_only", language),
+        language,
+    )
 
 @router.callback_query(UserAICallback.filter(F.action == "back_to_ai"))
 async def back_to_ai(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
-    user = await upsert_user(session, callback.from_user)
-    language = normalize_language(user.content_language_code)
+    data = await state.get_data()
 
-    await state.set_state(AskAI.question)
+    history_id = data.get("ai_history_message_id")
+    history_chat_id = data.get("ai_history_chat_id")
 
-    if callback.message:
-        await safe_edit_text(
-            callback.message,
-            t("ai_prompt", language),
-            reply_markup=cancel_keyboard(language),
+    if (
+        callback.message
+        and callback.message.message_id == history_id
+        and callback.message.chat.id == history_chat_id
+    ):
+        await safe_delete_message(callback.message)
+
+        await state.update_data(
+            ai_history_message_id=None,
+            ai_history_chat_id=None,
         )
+
+    if await state.get_state() != AskAI.question.state:
+        await state.set_state(AskAI.question)
 
     await callback.answer()
 
 @router.callback_query(UserAIHistoryCallback.filter(F.action == "list"))
-async def my_questions(callback: CallbackQuery, callback_data: UserAIHistoryCallback, session: AsyncSession) -> None:
+async def my_questions(callback: CallbackQuery, callback_data: UserAIHistoryCallback, session: AsyncSession, state: FSMContext) -> None:
     user = await upsert_user(session, callback.from_user)
     language = normalize_language(user.content_language_code)
 
@@ -248,24 +450,27 @@ async def my_questions(callback: CallbackQuery, callback_data: UserAIHistoryCall
     text = (
         f"<b>{t('my_questions_title', language)}</b>\n\n"
         f"{t('my_questions_total', language)}: {total}\n"
-        f"{t('my_questions_page', language)}: {page + 1}/{pages}\n\n"
+        f"{t('my_questions_page', language)}: "
+        f"{page + 1}/{pages}\n\n"
         f"{t('my_questions_choose', language)}"
     )
 
     if not records:
-        text += f"\n\n{t('my_questions_empty', language)}"
-
-    if callback.message:
-        await safe_edit_text(
-            callback.message,
-            text,
-            reply_markup=my_questions_keyboard(
-                records,
-                page,
-                pages,
-                language,
-            ),
+        text += (
+            f"\n\n{t('my_questions_empty', language)}"
         )
+
+    await show_ai_history(
+        callback,
+        state,
+        text,
+        my_questions_keyboard(
+            records,
+            page,
+            pages,
+            language,
+        ),
+    )
 
     await callback.answer()
 

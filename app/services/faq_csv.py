@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from app.database.models import FAQItem
 from app.database.models.enums import LanguageCode
 
+from app.services.csv_export import build_csv
+
 CSV_COLUMNS = ("question_ru", "answer_ru", "question_kk", "answer_kk", "is_active")
 REQUIRED_COLUMNS = {"question_ru", "answer_ru"}
 MAX_CSV_BYTES = 1_000_000
@@ -130,35 +132,35 @@ def parse_faq_csv(data: bytes, existing_questions: set[str]) -> FAQCSVPreview:
 
 
 def export_faq_csv(items: list[FAQItem]) -> bytes:
-    stream = io.StringIO(newline="")
-    writer = csv.DictWriter(stream, fieldnames=CSV_COLUMNS, lineterminator="\r\n")
-    writer.writeheader()
+    rows = []
+
     for item in items:
         ru = next((value for value in item.translations if value.language_code == LanguageCode.RU), None)
         kk = next((value for value in item.translations if value.language_code == LanguageCode.KK), None)
-        writer.writerow({
-            "question_ru": _spreadsheet_safe(ru.question if ru else item.question),
-            "answer_ru": _spreadsheet_safe(ru.answer if ru else item.answer),
-            "question_kk": _spreadsheet_safe(kk.question if kk else ""),
-            "answer_kk": _spreadsheet_safe(kk.answer if kk else ""),
-            "is_active": "true" if item.is_active else "false",
-        })
-    return stream.getvalue().encode("utf-8-sig")
 
+        rows.append(
+            (
+                ru.question if ru else item.question,
+                ru.answer if ru else item.answer,
+                kk.question if kk else "",
+                kk.answer if kk else "",
+                "true" if item.is_active else "false",
+            )
+        )
 
-def _spreadsheet_safe(value: str) -> str:
-    return f"'{value}" if value.startswith(("=", "+", "-", "@")) else value
+    return build_csv(CSV_COLUMNS, rows)
 
 
 def faq_template_csv() -> bytes:
-    stream = io.StringIO(newline="")
-    writer = csv.DictWriter(stream, fieldnames=CSV_COLUMNS, lineterminator="\r\n")
-    writer.writeheader()
-    writer.writerow({
-        "question_ru": "Как поступить?",
-        "answer_ru": "Ответ...",
-        "question_kk": "Қалай оқуға түсуге болады?",
-        "answer_kk": "Жауап...",
-        "is_active": "true",
-    })
-    return stream.getvalue().encode("utf-8-sig")
+    return build_csv(
+        CSV_COLUMNS,
+        [
+            (
+                "Как поступить?",
+                "Ответ...",
+                "Қалай оқуға түсуге болады?",
+                "Жауап...",
+                "true",
+            )
+        ],
+    )

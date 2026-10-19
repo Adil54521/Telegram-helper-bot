@@ -27,6 +27,25 @@ class UserAIHistoryTests(unittest.IsolatedAsyncioTestCase):
 
         self.session = MagicMock()
 
+        self.state = MagicMock()
+        self.state.get_data = AsyncMock(return_value={})
+        self.state.update_data = AsyncMock()
+        self.state.get_state = AsyncMock(
+            return_value=AskAI.question.state
+        )
+        self.state.set_state = AsyncMock()
+
+        self.callback.message.message_id = 100
+        self.callback.message.chat.id = 123456
+        self.callback.message.answer = AsyncMock(
+            return_value=SimpleNamespace(
+                message_id=200,
+                chat=SimpleNamespace(id=123456),
+            )
+        )
+
+        self.callback.bot.edit_message_text = AsyncMock()
+
         self.repo = MagicMock()
         self.repo.count_for_user = AsyncMock(return_value=0)
         self.repo.list_for_user = AsyncMock(return_value=[])
@@ -151,8 +170,6 @@ class UserAIHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(":3:", back_button.callback_data)
 
     async def test_empty_history(self) -> None:
-        """Пустая история должна отображаться корректно."""
-
         callback_data = SimpleNamespace(
             action="list",
             page=0,
@@ -163,6 +180,7 @@ class UserAIHistoryTests(unittest.IsolatedAsyncioTestCase):
             callback=self.callback,
             callback_data=callback_data,
             session=self.session,
+            state=self.state,
         )
 
         self.repo.count_for_user.assert_awaited_once_with(10)
@@ -173,14 +191,21 @@ class UserAIHistoryTests(unittest.IsolatedAsyncioTestCase):
             offset=0,
         )
 
-        text = self.edit_mock.await_args.args[1]
+        self.callback.message.answer.assert_awaited_once()
+
+        text = self.callback.message.answer.await_args.args[0]
 
         self.assertIn("История", text)
         self.assertIn("0", text)
 
-    async def test_pagination_second_page(self) -> None:
-        """Вторая страница должна использовать правильный OFFSET."""
+        self.edit_mock.assert_not_awaited()
 
+        self.state.update_data.assert_awaited_once_with(
+            ai_history_message_id=200,
+            ai_history_chat_id=123456,
+        )
+
+    async def test_pagination_second_page(self) -> None:
         self.repo.count_for_user.return_value = 13
 
         self.repo.list_for_user.return_value = [
@@ -200,6 +225,7 @@ class UserAIHistoryTests(unittest.IsolatedAsyncioTestCase):
             callback=self.callback,
             callback_data=callback_data,
             session=self.session,
+            state=self.state,
         )
 
         self.repo.list_for_user.assert_awaited_once_with(
@@ -208,7 +234,10 @@ class UserAIHistoryTests(unittest.IsolatedAsyncioTestCase):
             offset=5,
         )
 
-        keyboard = self.edit_mock.await_args.kwargs["reply_markup"]
+        keyboard = (
+            self.callback.message.answer
+            .await_args.kwargs["reply_markup"]
+        )
 
         callbacks = [
             button.callback_data
@@ -220,28 +249,33 @@ class UserAIHistoryTests(unittest.IsolatedAsyncioTestCase):
             any("open" in value for value in callbacks)
         )
 
-    async def test_back_to_ai_restores_state(self) -> None:
-        """Возврат к ИИ должен восстанавливать FSM."""
+    async def test_back_to_ai_closes_history(self) -> None:
+        self.state.get_data.return_value = {
+            "ai_history_message_id": 100,
+            "ai_history_chat_id": 123456,
+        }
 
-        state = MagicMock()
-        state.set_state = AsyncMock()
+        with patch(
+            f"{MODULE}.safe_delete_message",
+            new_callable=AsyncMock,
+        ) as delete:
+            await back_to_ai(
+                callback=self.callback,
+                session=self.session,
+                state=self.state,
+            )
 
-        await back_to_ai(
-            callback=self.callback,
-            session=self.session,
-            state=state,
+        delete.assert_awaited_once_with(
+            self.callback.message,
         )
 
-        state.set_state.assert_awaited_once_with(
-            AskAI.question,
+        self.state.update_data.assert_awaited_once_with(
+            ai_history_message_id=None,
+            ai_history_chat_id=None,
         )
 
-        self.edit_mock.assert_awaited_once()
-
-        text = self.edit_mock.await_args.args[1]
-
-        self.assertIn("Задайте вопрос", text)
-
+        self.state.set_state.assert_not_awaited()
+        self.edit_mock.assert_not_awaited()
         self.callback.answer.assert_awaited_once()
 
 

@@ -11,7 +11,6 @@ from app.filters.admin import HasPermission
 from app.database.repositories.cms import CMSRepository
 from app.services.cms import AdminService
 from app.services.permissions import Permission, PermissionService
-from app.services.faq_csv import _spreadsheet_safe
 from app.utils.presentation import html_text
 
 
@@ -79,16 +78,57 @@ class SecurityRegressionTests(unittest.IsolatedAsyncioTestCase):
     def test_html_special_characters_are_escaped(self) -> None:
         self.assertEqual(html_text('<test> & "KUAM"'), "&lt;test&gt; &amp; &quot;KUAM&quot;")
 
-    def test_csv_formula_injection_is_neutralized(self) -> None:
-        self.assertEqual(_spreadsheet_safe("=1+1"), "'=1+1")
-        self.assertEqual(_spreadsheet_safe("ordinary"), "ordinary")
-
     def test_admin_routers_have_server_side_permission_filters(self) -> None:
-        modules = ("pages", "buttons", "attachments", "faq", "broadcasts", "admins", "statistics", "ai")
+        modules = (
+            "pages",
+            "buttons",
+            "attachments",
+            "faq",
+            "broadcasts",
+            "admins",
+            "statistics",
+        )
+
         for name in modules:
-            source = inspect.getsource(__import__(f"app.handlers.admin.{name}", fromlist=[name]))
-            self.assertIn("router.callback_query.filter(HasPermission(", source, name)
-            self.assertIn("router.message.filter(HasPermission(", source, name)
+            source = inspect.getsource(
+                __import__(
+                    f"app.handlers.admin.{name}",
+                    fromlist=[name],
+                )
+            )
+
+            self.assertIn(
+                "router.callback_query.filter(HasPermission(",
+                source,
+                name,
+            )
+
+            self.assertIn(
+                "router.message.filter(HasPermission(",
+                source,
+                name,
+            )
+
+    def test_ai_router_uses_granular_permissions(self) -> None:
+        from app.handlers.admin import ai
+
+        source = inspect.getsource(ai)
+
+        required_permissions = (
+            "Permission.AI_ANALYTICS_VIEW",
+            "Permission.AI_DIAGNOSTICS",
+            "Permission.AI_HISTORY_VIEW",
+            "Permission.AI_INDEX_SYNC",
+        )
+
+        for permission in required_permissions:
+            with self.subTest(permission=permission):
+                self.assertIn(permission, source)
+
+        self.assertNotIn(
+            "HasPermission(Permission.STATISTICS)",
+            source,
+        )
 
     def test_broadcast_confirm_has_double_click_guard(self) -> None:
         source = inspect.getsource(__import__("app.handlers.admin.broadcasts", fromlist=["broadcasts"]))

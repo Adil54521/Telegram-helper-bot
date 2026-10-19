@@ -10,17 +10,20 @@ from app.utils.telegram import safe_edit_text
 from app.filters.admin import HasPermission
 
 router = Router(name="statistics")
-router.callback_query.filter(HasPermission(Permission.STATISTICS))
-router.message.filter(HasPermission(Permission.STATISTICS))
+router.callback_query.filter(HasPermission(Permission.STATISTICS_VIEW))
+router.message.filter(HasPermission(Permission.STATISTICS_VIEW))
 
 
 @router.callback_query(AdminMenuCallback.filter(F.section == "statistics"))
 async def statistics(callback: CallbackQuery, session: AsyncSession, settings: Settings) -> None:
-    if not await PermissionService(session, settings).has(callback.from_user.id, Permission.STATISTICS):
+    if not await PermissionService(session, settings).has(callback.from_user.id, Permission.STATISTICS_VIEW):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
+    
     values = await user_statistics(session)
     text = f"📊 <b>Статистика</b>\n\nВсего пользователей: {values['total']}\nНовых сегодня: {values['new_today']}\nНовых за 7 дней: {values['new_week']}\nАктивных за 7 дней: {values['active_week']}"
+    
     if callback.message:
         await safe_edit_text(callback.message, text)
+    
     await callback.answer()

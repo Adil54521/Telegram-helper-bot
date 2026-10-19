@@ -139,6 +139,10 @@ async def allowed(user_id: int, session: AsyncSession, settings: Settings) -> bo
     return await PermissionService(session, settings).has(user_id, Permission.CONTENT)
 
 
+async def can_manage_import(user_id: int, session: AsyncSession, settings: Settings) -> bool:
+    return await PermissionService(session, settings).has(user_id, Permission.TELEGRAM_IMPORT_MANAGE)
+
+
 def status_value(value: str) -> TelegramContentStatus:
     try:
         return TelegramContentStatus(value)
@@ -196,9 +200,10 @@ async def render_list(
             InlineKeyboardButton(text=f"{page + 1} / {pages}", callback_data="noop"),
             InlineKeyboardButton(text="➡️", callback_data=cb("list", page=min(pages - 1, page + 1), filter_=status.value)),
         ])
+    if await can_manage_import(callback.from_user.id, session, settings):
+        rows.append([InlineKeyboardButton(text="⚙️ Настройки импорта", callback_data=cb("settings"))])
     rows.extend([
         [InlineKeyboardButton(text="🔄 Обновить", callback_data=cb("list", page=page, filter_=status.value))],
-        [InlineKeyboardButton(text="⚙️ Настройки импорта", callback_data=cb("settings"))],
         [InlineKeyboardButton(text="🧪 Проверить подключение", callback_data=cb("diagnostic"))],
         [InlineKeyboardButton(text="⬅️ Панель", callback_data=AdminMenuCallback(section="dashboard").pack())],
     ])
@@ -261,12 +266,12 @@ async def render_import_settings(callback: CallbackQuery, session: AsyncSession,
     await callback.answer()
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action == "settings"))
+@router.callback_query(ChannelPostCallback.filter(F.action == "settings"), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def import_settings(callback: CallbackQuery, session: AsyncSession, settings: Settings) -> None:
     await render_import_settings(callback, session, settings)
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action.in_({"auto_toggle", "notify_toggle", "settle"})))
+@router.callback_query(ChannelPostCallback.filter(F.action.in_({"auto_toggle", "notify_toggle", "settle"})), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def change_import_settings(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
     if settings.content_chat_id is None:
         return await callback.answer("Источник не настроен", show_alert=True)
@@ -307,87 +312,137 @@ async def render_mappings(callback: CallbackQuery, session: AsyncSession, settin
     await callback.answer()
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action == "maps"))
+@router.callback_query(ChannelPostCallback.filter(F.action == "maps"), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def mappings_list(callback: CallbackQuery, session: AsyncSession, settings: Settings) -> None:
     await render_mappings(callback, session, settings)
 
 
 @router.callback_query(ChannelPostCallback.filter(F.action.in_({"edit_open", "edit_apply", "edit_reject"})))
 async def edit_review_action(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
+    action = callback_data.action
+
+    if action == "edit_apply" and not await PermissionService(session, settings).has(callback.from_user.id, Permission.CONTENT_PUBLISH):
+        await callback.answer("Недостаточно прав для публикации", show_alert=True)
+        return
+
     pending = await session.get(TelegramEditPending, callback_data.item_id)
+
     if not pending:
-        return await callback.answer("Изменение не найдено", show_alert=True)
+        await callback.answer("Изменение не найдено", show_alert=True)
+        return
+
     if pending.status == "MATERIAL_REVIEW":
         file_pending = await session.scalar(
             select(TelegramAttachmentReplacement).where(
                 TelegramAttachmentReplacement.source_post_id == pending.source_post_id
             )
         )
+
         if not file_pending:
-            return await callback.answer(
-                "Файловая замена для этого старого изменения не найдена. Повторно отредактируйте файл в Telegram.",
-                show_alert=True,
-            )
-        action = {
+            await callback.answer("Файловая замена не найдена.", show_alert=True)
+            return
+
+        file_action = {
             "edit_open": "open",
             "edit_apply": "apply",
             "edit_reject": "reject",
-        }[callback_data.action]
-        await _handle_file_pending(callback, session, file_pending, action, legacy_text_pending=pending)
+        }[action]
+
+        await _handle_file_pending(callback, session, file_pending, file_action, legacy_text_pending=pending, settings=settings)
         return
-    if callback_data.action == "edit_apply":
-        try:
-            await TelegramEditSyncService(session, callback.from_user.id).apply_pending(pending.id)
-        except ValueError as error:
-            return await callback.answer(str(error), show_alert=True)
-        await callback.answer("Изменение опубликовано")
-        if callback.message:
-            await safe_edit_text(callback.message, "✅ <b>Изменение применено и опубликовано</b>")
-        return
-    if callback_data.action == "edit_reject":
+
+    if action == "edit_reject":
         await TelegramEditSyncService(session, callback.from_user.id).reject_pending(pending.id)
         await callback.answer("Изменение отклонено")
+
         if callback.message:
             await safe_edit_text(callback.message, "🚫 <b>Изменение отклонено</b>")
         return
-    text = (
-        f"📝 <b>Изменение Telegram-публикации</b>\n\nСтатус: {html_text(pending.status)}"
-        f"\n\n🇷🇺 <b>{html_text(pending.title_ru or '—')}</b>\n{html_text(text_preview(pending.text_ru, 500))}"
-        f"\n\n🇰🇿 <b>{html_text(pending.title_kk or '—')}</b>\n{html_text(text_preview(pending.text_kk, 500))}"
-    )
-    rows = [[InlineKeyboardButton(text="✅ Применить", callback_data=cb("edit_apply", pending.id))], [InlineKeyboardButton(text="🚫 Отклонить", callback_data=cb("edit_reject", pending.id))]]
+
+    if action == "edit_open":
+        text = (
+            f"📝 <b>Изменение Telegram-публикации</b>\n\n"
+            f"Статус: {html_text(pending.status)}"
+            f"\n\n🇷🇺 <b>{html_text(pending.title_ru or '—')}</b>"
+            f"\n{html_text(text_preview(pending.text_ru, 500))}"
+            f"\n\n🇰🇿 <b>{html_text(pending.title_kk or '—')}</b>"
+            f"\n{html_text(text_preview(pending.text_kk, 500))}"
+        )
+
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="🚫 Отклонить",
+                    callback_data=cb("edit_reject", pending.id),
+                )
+            ],
+        ]
+
+        if await PermissionService(session, settings).has(callback.from_user.id, Permission.CONTENT_PUBLISH):
+            rows.insert(0, [InlineKeyboardButton(text="✅ Применить", callback_data=cb("edit_apply", pending.id))])
+
+        if callback.message:
+            await safe_edit_text(callback.message, text, reply_markup=keyboard(rows))
+
+        await callback.answer()
+        return
+
+    if action != "edit_apply":
+        await callback.answer("Неизвестное действие", show_alert=True)
+        return
+
+    try:
+        await TelegramEditSyncService(session, callback.from_user.id).apply_pending(pending.id)
+    except ValueError as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+
+    await callback.answer("Изменение опубликовано")
+
     if callback.message:
-        await safe_edit_text(callback.message, text, reply_markup=keyboard(rows))
-    await callback.answer()
+        await safe_edit_text(callback.message, "✅ <b>Изменение применено и опубликовано</b>")
 
 
 @router.callback_query(ChannelPostCallback.filter(F.action.in_({"faq_edit_open", "faq_edit_apply", "faq_edit_reject"})))
-async def faq_edit_review_action(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession) -> None:
+async def faq_edit_review_action(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
     pending = await session.get(TelegramFAQEditPending, callback_data.item_id)
+    
     if not pending:
         return await callback.answer("Изменение FAQ не найдено", show_alert=True)
+    
     service = TelegramFAQEditSyncService(session, callback.from_user.id)
+    
     if callback_data.action == "faq_edit_apply":
+        if not await PermissionService(session, settings).has(callback.from_user.id, Permission.FAQ_PUBLISH):
+            await callback.answer("Недостаточно прав для публикации", show_alert=True)
+            return
+        
         try:
             await service.apply_pending(pending.id)
         except ValueError as error:
             return await callback.answer(str(error), show_alert=True)
+    
         await callback.answer("FAQ обновлён")
+    
         if callback.message:
             await safe_edit_text(callback.message, "✅ <b>Изменение FAQ применено</b>")
         return
+    
     if callback_data.action == "faq_edit_reject":
         try:
             await service.reject_pending(pending.id)
         except ValueError as error:
             return await callback.answer(str(error), show_alert=True)
         await callback.answer("Изменение отклонено")
+    
         if callback.message:
             await safe_edit_text(callback.message, "🚫 <b>Изменение FAQ отклонено</b>")
         return
+    
     faq = await session.get(FAQItem, pending.faq_id)
     if not faq:
         return await callback.answer("Связанный FAQ удалён", show_alert=True)
+    
     old = await faq_snapshot(session, faq)
     text = (
         "📝 <b>Изменение Telegram FAQ</b>\n\n"
@@ -399,16 +454,23 @@ async def faq_edit_review_action(callback: CallbackQuery, callback_data: Channel
         f"🇰🇿 <b>Стало:</b>\n{html_text(text_preview(pending.answer_kk, 450))}"
     )
     rows = []
-    if pending.status == "REVIEW" and all((pending.question_ru, pending.answer_ru, pending.question_kk, pending.answer_kk)):
+    if (
+        pending.status == "REVIEW"
+        and all((pending.question_ru, pending.answer_ru, pending.question_kk, pending.answer_kk))
+        and await PermissionService(session, settings).has(callback.from_user.id, Permission.FAQ_PUBLISH)
+    ):
         rows.append([InlineKeyboardButton(text="✅ Применить", callback_data=cb("faq_edit_apply", pending.id))])
+    
     if pending.status not in {"APPLIED", "REJECTED"}:
         rows.append([InlineKeyboardButton(text="🚫 Отклонить", callback_data=cb("faq_edit_reject", pending.id))])
+    
     if callback.message:
         await safe_edit_text(callback.message, text, reply_markup=keyboard(rows) if rows else None)
+    
     await callback.answer()
 
 
-async def _render_file_pending(callback: CallbackQuery, session: AsyncSession, pending: TelegramAttachmentReplacement) -> None:
+async def _render_file_pending(callback: CallbackQuery, session: AsyncSession, pending: TelegramAttachmentReplacement, settings: Settings) -> None:
     old = await session.get(PageAttachment, pending.attachment_id) if pending.attachment_id else None
     page = await PageRepository(session).by_id(pending.page_id)
     title = page.draft_revision.title if page and page.draft_revision else (page.key if page else "—")
@@ -424,7 +486,7 @@ async def _render_file_pending(callback: CallbackQuery, session: AsyncSession, p
         f"Статус: {html_text(pending.status)}"
     )
     rows = []
-    if pending.status == "REVIEW" and pending.attachment_id:
+    if pending.status == "REVIEW" and pending.attachment_id and await PermissionService(session, settings).has(callback.from_user.id, Permission.CONTENT_PUBLISH):
         rows.append([InlineKeyboardButton(text="✅ Применить замену", callback_data=cb("file_apply", pending.id))])
     if pending.status not in {"APPLIED", "REJECTED"}:
         rows.append([InlineKeyboardButton(text="❌ Отклонить", callback_data=cb("file_reject", pending.id))])
@@ -440,6 +502,7 @@ async def _handle_file_pending(
     action: str,
     *,
     legacy_text_pending: TelegramEditPending | None = None,
+    settings: Settings,
 ) -> None:
     service = TelegramAttachmentSyncService(session, callback.from_user.id)
     if action == "apply":
@@ -464,20 +527,31 @@ async def _handle_file_pending(
         if callback.message:
             await safe_edit_text(callback.message, "🚫 <b>Замена отклонена. Вложение не изменено.</b>")
         return
-    await _render_file_pending(callback, session, pending)
+    await _render_file_pending(callback, session, pending, settings)
 
 
 @router.callback_query(ChannelPostCallback.filter(F.action.in_({"file_open", "file_apply", "file_reject"})))
-async def file_review_action(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession) -> None:
+async def file_review_action(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
+    if callback_data.action == "file_apply":
+        if not await PermissionService(session, settings).has(callback.from_user.id, Permission.CONTENT_PUBLISH):
+            await callback.answer("Недостаточно прав для замены файла", show_alert=True)
+            return
+        
     pending = await session.get(TelegramAttachmentReplacement, callback_data.item_id)
     if not pending:
         return await callback.answer("Замена не найдена", show_alert=True)
+    
     action = {"file_open": "open", "file_apply": "apply", "file_reject": "reject"}[callback_data.action]
-    await _handle_file_pending(callback, session, pending, action)
+    
+    await _handle_file_pending(callback, session, pending, action, settings=settings)
 
 
 @router.callback_query(ChannelPostCallback.filter(F.action.in_({"replace_pick", "replace_confirm"})))
-async def manual_file_replacement(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession) -> None:
+async def manual_file_replacement(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
+    if not await PermissionService(session, settings).has(callback.from_user.id, Permission.CONTENT_PUBLISH):
+        await callback.answer("Недостаточно прав для замены файлов", show_alert=True)
+        return
+
     if callback_data.action == "replace_pick":
         rows_data = (await session.execute(
             select(PageAttachment, BotPage, BotPageRevision)
@@ -503,7 +577,7 @@ async def manual_file_replacement(callback: CallbackQuery, callback_data: Channe
     await callback.answer()
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action == "map_add"))
+@router.callback_query(ChannelPostCallback.filter(F.action == "map_add"), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def mapping_add(callback: CallbackQuery, session: AsyncSession, settings: Settings) -> None:
     if settings.content_chat_id is None:
         return await callback.answer("Источник не настроен", show_alert=True)
@@ -518,7 +592,7 @@ async def mapping_add(callback: CallbackQuery, session: AsyncSession, settings: 
     await callback.answer()
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action == "map_topic"))
+@router.callback_query(ChannelPostCallback.filter(F.action == "map_topic"), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def mapping_select_page(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
     pages = [page for page in await PageRepository(session).all() if page.is_active]
     topic_name = None
@@ -532,7 +606,7 @@ async def mapping_select_page(callback: CallbackQuery, callback_data: ChannelPos
     await callback.answer()
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action == "map_page"))
+@router.callback_query(ChannelPostCallback.filter(F.action == "map_page"), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def mapping_confirm(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
     if settings.content_chat_id is None:
         return await callback.answer("Источник не настроен", show_alert=True)
@@ -558,7 +632,7 @@ async def mapping_confirm(callback: CallbackQuery, callback_data: ChannelPostCal
     await callback.answer()
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action == "map_confirm"))
+@router.callback_query(ChannelPostCallback.filter(F.action == "map_confirm"), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def mapping_create(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
     if settings.content_chat_id is None:
         return await callback.answer("Источник не настроен", show_alert=True)
@@ -581,7 +655,7 @@ async def mapping_create(callback: CallbackQuery, callback_data: ChannelPostCall
     await render_mappings(callback, session, settings)
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action == "map_faq_confirm"))
+@router.callback_query(ChannelPostCallback.filter(F.action == "map_faq_confirm"), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def mapping_create_faq(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
     if settings.content_chat_id is None or callback_data.thread_id <= 0:
         return await callback.answer("Некорректный Topic", show_alert=True)
@@ -601,7 +675,7 @@ async def mapping_create_faq(callback: CallbackQuery, callback_data: ChannelPost
     await render_mappings(callback, session, settings)
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action == "target_page_pick"))
+@router.callback_query(ChannelPostCallback.filter(F.action == "target_page_pick"), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def mapping_target_page_pick(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
     item = await session.get(TelegramTopicPageMapping, callback_data.item_id)
     page = await PageRepository(session).by_id(callback_data.thread_id)
@@ -617,7 +691,7 @@ async def mapping_target_page_pick(callback: CallbackQuery, callback_data: Chann
     await render_mappings(callback, session, settings)
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action.in_({"map_open", "map_active", "map_attach", "map_delete", "map_delete_yes", "mode_manual", "mode_draft", "mode_publish_ask", "mode_publish_yes", "edit_off", "edit_review", "edit_auto_ask", "edit_auto_yes", "file_off", "file_review", "file_auto_ask", "file_auto_yes", "target_page", "target_faq"})))
+@router.callback_query(ChannelPostCallback.filter(F.action.in_({"map_open", "map_active", "map_attach", "map_delete", "map_delete_yes", "mode_manual", "mode_draft", "mode_publish_ask", "mode_publish_yes", "edit_off", "edit_review", "edit_auto_ask", "edit_auto_yes", "file_off", "file_review", "file_auto_ask", "file_auto_yes", "target_page", "target_faq"})), HasPermission(Permission.TELEGRAM_IMPORT_MANAGE))
 async def mapping_action(callback: CallbackQuery, callback_data: ChannelPostCallback, session: AsyncSession, settings: Settings) -> None:
     item = await session.get(TelegramTopicPageMapping, callback_data.item_id)
     if not item or item.chat_id != settings.content_chat_id:
@@ -747,6 +821,7 @@ def post_card(
     filter_: str,
     grouping: PublicationGroupingResult | None = None,
     faq_parsed=None,
+    can_publish: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
     value = source_text(post)
     parsed = parse_post(post)
@@ -796,7 +871,7 @@ def post_card(
     if post.status == TelegramContentStatus.NEW:
         if grouping and grouping.materials:
             rows.append([InlineKeyboardButton(text="📎 Настроить материалы", callback_data=cb("materials", post.id, page, filter_))])
-        if post.media:
+        if post.media and can_publish:
             rows.append([InlineKeyboardButton(text="🔁 Заменить существующий материал", callback_data=cb("replace_pick", post.id, page, filter_))])
         rows.extend([
             [InlineKeyboardButton(text="📄 Создать страницу", callback_data=cb("manual_page", post.id, page, filter_))],
@@ -829,7 +904,8 @@ async def open_post(callback: CallbackQuery, callback_data: ChannelPostCallback,
     grouping = await group_post(post, session)
     mapping = await TelegramAutoDraftRepository(session).mapping(post.chat_id, post.message_thread_id) if post.message_thread_id is not None else None
     faq_parsed = FAQ_PARSER.parse(source_text(post)) if mapping and mapping.content_target == TelegramContentTarget.FAQ else None
-    text, markup = post_card(post, callback_data.page, callback_data.status, grouping, faq_parsed)
+    can_publish = await PermissionService(session, settings).has(callback.from_user.id, Permission.CONTENT_PUBLISH)
+    text, markup = post_card(post, callback_data.page, callback_data.status, grouping, faq_parsed, can_publish=can_publish)
     if callback.message:
         await safe_edit_text(callback.message, text, reply_markup=markup)
     await callback.answer()
@@ -952,7 +1028,8 @@ async def materials_back(callback: CallbackQuery, callback_data: ChannelPostCall
         await callback.answer("Публикация не найдена", show_alert=True)
         return
     grouping = await group_post(post, session)
-    text, markup = post_card(post, callback_data.page, callback_data.status, grouping)
+    can_publish = await PermissionService(session, settings).has(callback.from_user.id, Permission.CONTENT_PUBLISH)
+    text, markup = post_card(post, callback_data.page, callback_data.status, grouping, can_publish=can_publish)
     if callback.message:
         await safe_edit_text(callback.message, text, reply_markup=markup)
     await callback.answer()
@@ -1089,7 +1166,7 @@ async def manual_faq(callback: CallbackQuery, callback_data: ChannelPostCallback
     await prepare_manual(callback, callback_data, session, settings, state, "FAQ")
 
 
-@router.callback_query(ChannelPostCallback.filter(F.action.startswith("edit_")))
+@router.callback_query(ChannelPostCallback.filter(F.action.in_({"edit_title_ru", "edit_text_ru", "edit_title_kk", "edit_text_kk", "edit_question_ru", "edit_answer_ru", "edit_question_kk", "edit_answer_kk"})))
 async def edit_field(callback: CallbackQuery, callback_data: ChannelPostCallback, state: FSMContext) -> None:
     field = callback_data.action.removeprefix("edit_")
     allowed_fields = {"title_ru", "text_ru", "title_kk", "text_kk", "question_ru", "answer_ru", "question_kk", "answer_kk"}
@@ -1234,7 +1311,7 @@ async def create_draft(callback: CallbackQuery, callback_data: ChannelPostCallba
             )
             await service.create_page(item_id, settings.content_chat_id, callback.from_user.id, title_ru=data["channel_title_ru"], text_ru=data["channel_text_ru"], title_kk=data.get("channel_title_kk"), text_kk=data.get("channel_text_kk"), materials=selected_materials)
         else:
-            faq = await service.create_faq(item_id, settings.content_chat_id, callback.from_user.id, question_ru=data["channel_question_ru"], answer_ru=data["channel_answer_ru"], question_kk=data.get("channel_question_kk"), answer_kk=data.get("channel_answer_kk"))
+            faq = await service.create_faq(item_id, settings.content_chat_id, callback.from_user.id, question_ru=data["channel_question_ru"], answer_ru=data["channel_answer_ru"], question_kk=data.get("channel_question_kk"), answer_kk=data.get("channel_answer_kk"), is_active=False)
             session.add(AuditLog(admin_id=callback.from_user.id, action="TELEGRAM_FAQ_MANUALLY_CREATED", entity_type="FAQItem", entity_id=str(faq.id), new_data={"source_post_id": item_id}))
             await queue_faq_knowledge_sync(session, faq.id, callback.from_user.id)
     except ValueError as error:
@@ -1274,6 +1351,7 @@ async def cancel(callback: CallbackQuery, callback_data: ChannelPostCallback, se
     post = await load_post(callback_data.item_id, session, settings)
     if post and callback.message:
         grouping = await group_post(post, session)
-        text, markup = post_card(post, page, filter_, grouping)
+        can_publish = await PermissionService(session, settings).has(callback.from_user.id, Permission.CONTENT_PUBLISH)
+        text, markup = post_card(post, page, filter_, grouping, can_publish=can_publish)
         await safe_edit_text(callback.message, text, reply_markup=markup)
     await callback.answer()

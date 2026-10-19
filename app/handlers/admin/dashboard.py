@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.callbacks import AdminMenuCallback
 from app.config import Settings
+from app.database.models.enums import AdminRole
 from app.keyboards.admin import dashboard
 from app.services.permissions import PermissionService
 from app.utils.telegram import safe_edit_text
@@ -20,6 +21,17 @@ logger = logging.getLogger(__name__)
 async def noop(callback: CallbackQuery) -> None:
     await callback.answer()
 
+def dashboard_text(role: AdminRole) -> str:
+    if role == AdminRole.AI_HISTORY_VIEWER:
+        return (
+            "⚙️ <b>Панель управления</b>\n\n"
+            "Доступен просмотр истории вопросов ИИ."
+        )
+
+    return (
+        "⚙️ <b>Панель управления</b>\n\n"
+        "Управление содержимым Telegram-бота"
+    )
 
 @router.message(Command("admin"))
 async def admin(message: Message, session: AsyncSession, settings: Settings) -> None:
@@ -30,7 +42,7 @@ async def admin(message: Message, session: AsyncSession, settings: Settings) -> 
         logger.info("Unauthorized admin entry user_id=%s", message.from_user.id)
         await send_page(message, session, "main", ai_available=settings.ai_available)
         return
-    await message.answer("⚙️ <b>Панель управления</b>\n\nУправление содержимым Telegram-бота", reply_markup=dashboard(role))
+    await message.answer(text=dashboard_text(role), reply_markup=dashboard(role))
 
 
 @router.callback_query(AdminMenuCallback.filter(F.section == "dashboard"))
@@ -40,5 +52,5 @@ async def back_dashboard(callback: CallbackQuery, session: AsyncSession, setting
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     if callback.message:
-        await safe_edit_text(callback.message, "⚙️ <b>Панель управления</b>\n\nУправление содержимым Telegram-бота", reply_markup=dashboard(role))
+        await safe_edit_text(callback.message, text=dashboard_text(role), reply_markup=dashboard(role))
     await callback.answer()

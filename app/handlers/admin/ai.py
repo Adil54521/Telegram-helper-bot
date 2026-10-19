@@ -11,7 +11,7 @@ from app.ai.service import AIService, MAX_QUESTION_LENGTH
 from app.callbacks import AdminAICallback, AdminMenuCallback
 from app.config import Settings
 from app.database.models import AIKnowledgeChunk, AIKnowledgeSyncJob, AuditLog, BotPage, FAQItem
-from app.database.models.enums import PageStatus
+from app.database.models.enums import AdminRole, PageStatus
 from app.database.repositories.users import upsert_user
 from app.services.ai_analytics import AIAnalyticsPeriod, AIAnalyticsService
 from app.services.permissions import Permission, PermissionService
@@ -23,19 +23,58 @@ from app.filters.admin import HasPermission
 logger = logging.getLogger(__name__)
 router = Router(name="admin_ai")
 
-router.callback_query.filter(HasPermission(Permission.STATISTICS))
-router.message.filter(HasPermission(Permission.STATISTICS))
-def ai_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🧪 Проверить Gemini", callback_data=AdminAICallback(action="health").pack())],
-            [InlineKeyboardButton(text="🔎 Проверить поиск", callback_data=AdminAICallback(action="search").pack())],
-            [InlineKeyboardButton(text="📚 Индекс знаний", callback_data=AdminAICallback(action="index").pack())],
-            [InlineKeyboardButton(text="📊 Аналитика", callback_data=AdminAICallback(action="analytics_today").pack())],
-            [InlineKeyboardButton(text="📜 История вопросов", callback_data=AdminAICallback(action="history").pack())],
-            [InlineKeyboardButton(text="⬅️ Панель", callback_data=AdminMenuCallback(section="dashboard").pack())],
-        ]
-    )
+AI_PANEL_PERMISSIONS = frozenset({
+    Permission.AI_ANALYTICS_VIEW,
+    Permission.AI_DIAGNOSTICS,
+    Permission.AI_HISTORY_VIEW,
+    Permission.AI_INDEX_SYNC,
+})
+
+def ai_keyboard(role: AdminRole | None) -> InlineKeyboardMarkup:
+    has = PermissionService.role_has
+    rows = []
+
+    if has(role, Permission.AI_DIAGNOSTICS):
+        for label, action in (
+            ("🧪 Проверить Gemini", "health"),
+            ("🔎 Проверить поиск", "search"),
+            ("📚 Индекс знаний", "index"),
+        ):
+            rows.append([
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=AdminAICallback(action=action).pack(),
+                )
+            ])
+
+    if has(role, Permission.AI_ANALYTICS_VIEW):
+        rows.append([
+            InlineKeyboardButton(
+                text="📊 Аналитика",
+                callback_data=AdminAICallback(
+                    action="analytics_today"
+                ).pack(),
+            )
+        ])
+
+    if has(role, Permission.AI_HISTORY_VIEW):
+        rows.append([
+            InlineKeyboardButton(
+                text="📜 История вопросов",
+                callback_data=AdminAICallback(action="history").pack(),
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="⬅️ Панель",
+            callback_data=AdminMenuCallback(
+                section="dashboard"
+            ).pack(),
+        )
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def back_keyboard() -> InlineKeyboardMarkup:
@@ -46,8 +85,18 @@ def back_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def allowed(user_id: int, session: AsyncSession, settings: Settings) -> bool:
-    return await PermissionService(session, settings).has(user_id, Permission.STATISTICS)
+async def allowed(user_id: int, session: AsyncSession, settings: Settings, permission: Permission) -> bool:
+    return await PermissionService(session, settings).has(user_id, permission)
+
+async def can_access_ai_panel(user_id: int, session: AsyncSession, settings: Settings) -> bool:
+    service = PermissionService(session, settings)
+
+    role = await service.role_for(user_id)
+
+    return any(
+        service.role_has(role, permission)
+        for permission in AI_PANEL_PERMISSIONS
+    )
 
 
 async def panel_text(session: AsyncSession, settings: Settings) -> str:
@@ -86,16 +135,29 @@ async def show_panel(
     settings: Settings,
     state: FSMContext,
 ) -> None:
-    if not await allowed(callback.from_user.id, session, settings):
-        await callback.answer("Доступ запрещён", show_alert=True)
+    permissions = PermissionService(session, settings)
+
+    role = await permissions.role_for(callback.from_user.id)
+
+    if not any(
+        permissions.role_has(role, permission)
+        for permission in AI_PANEL_PERMISSIONS
+    ):
+        await callback.answer(
+            "Доступ запрещён",
+            show_alert=True,
+        )
         return
+
     await state.clear()
+
     if callback.message:
         await safe_edit_text(
             callback.message,
             await panel_text(session, settings),
-            reply_markup=ai_keyboard(),
+            reply_markup=ai_keyboard(role),
         )
+
     await callback.answer()
 
 
@@ -106,7 +168,7 @@ async def health_check(
     settings: Settings,
     ai_service: AIService | None,
 ) -> None:
-    if not await allowed(callback.from_user.id, session, settings):
+    if not await allowed(callback.from_user.id, session, settings, Permission.AI_DIAGNOSTICS):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     if not settings.ai_available or ai_service is None:
@@ -169,7 +231,7 @@ async def analytics(
     session: AsyncSession,
     settings: Settings,
 ) -> None:
-    if not await allowed(callback.from_user.id, session, settings):
+    if not await allowed(callback.from_user.id, session, settings, Permission.AI_ANALYTICS_VIEW):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     periods = {
@@ -219,7 +281,7 @@ async def begin_search(
     settings: Settings,
     state: FSMContext,
 ) -> None:
-    if not await allowed(callback.from_user.id, session, settings):
+    if not await allowed(callback.from_user.id, session, settings, Permission.AI_DIAGNOSTICS):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     await state.set_state(TestAIRetrieval.query)
@@ -239,7 +301,7 @@ async def run_search(
     state: FSMContext,
     ai_service: AIService | None,
 ) -> None:
-    if not message.from_user or not await allowed(message.from_user.id, session, settings):
+    if not message.from_user or not await allowed(message.from_user.id, session, settings, Permission.AI_DIAGNOSTICS):
         await state.clear()
         return
     query = (message.text or "").strip()
@@ -261,13 +323,31 @@ async def run_search(
     await message.answer("\n".join(lines), reply_markup=back_keyboard())
 
 
-def index_keyboard(confirm: bool = False) -> InlineKeyboardMarkup:
+def index_keyboard(can_sync: bool, confirm: bool = False) -> InlineKeyboardMarkup:
     rows = []
-    if confirm:
-        rows.append([InlineKeyboardButton(text="🔴 Да, синхронизировать", callback_data=AdminAICallback(action="index_sync").pack())])
-    else:
-        rows.append([InlineKeyboardButton(text="🔄 Синхронизировать", callback_data=AdminAICallback(action="index_preview").pack())])
-    rows.append([InlineKeyboardButton(text="⬅️ ИИ-ассистент", callback_data=AdminMenuCallback(section="ai").pack())])
+
+    if can_sync:
+        action = "index_sync" if confirm else "index_preview"
+        label = (
+            "🔴 Да, синхронизировать"
+            if confirm
+            else "🔄 Синхронизировать"
+        )
+
+        rows.append([
+            InlineKeyboardButton(
+                text=label,
+                callback_data=AdminAICallback(action=action).pack(),
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="⬅️ ИИ-ассистент",
+            callback_data=AdminMenuCallback(section="ai").pack(),
+        )
+    ])
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -279,9 +359,24 @@ async def knowledge_index(
     settings: Settings,
     ai_service: AIService | None,
 ) -> None:
-    if not await allowed(callback.from_user.id, session, settings):
+    if not await allowed(callback.from_user.id, session, settings, Permission.AI_DIAGNOSTICS):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
+    
+    can_sync = await allowed(
+        callback.from_user.id,
+        session,
+        settings,
+        Permission.AI_INDEX_SYNC,
+    )
+
+    if callback_data.action == "index_preview" and not can_sync:
+        await callback.answer(
+            "Нет прав на синхронизацию индекса",
+            show_alert=True,
+        )
+        return
+    
     chunks = await session.scalar(select(func.count(AIKnowledgeChunk.id))) or 0
     ru = await session.scalar(select(func.count(AIKnowledgeChunk.id)).where(AIKnowledgeChunk.language_code == "ru")) or 0
     kk = await session.scalar(select(func.count(AIKnowledgeChunk.id)).where(AIKnowledgeChunk.language_code == "kk")) or 0
@@ -308,7 +403,11 @@ async def knowledge_index(
             "Для новых и изменённых чанков будет вызван Gemini Embeddings."
         )
     if callback.message:
-        await safe_edit_text(callback.message, text, reply_markup=index_keyboard(bool(preview)))
+        await safe_edit_text(callback.message, text, reply_markup=index_keyboard(
+            can_sync=can_sync,
+            confirm=bool(preview),
+        ))
+
     await callback.answer()
 
 
@@ -319,7 +418,7 @@ async def sync_knowledge_index(
     settings: Settings,
     ai_service: AIService | None,
 ) -> None:
-    if not await allowed(callback.from_user.id, session, settings):
+    if not await allowed(callback.from_user.id, session, settings, Permission.AI_INDEX_SYNC):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     if not ai_service or not ai_service.knowledge_index:
@@ -331,7 +430,7 @@ async def sync_knowledge_index(
     except Exception as error:
         logger.warning("Knowledge index sync failed admin_id=%s error=%s", callback.from_user.id, type(error).__name__)
         if callback.message:
-            await safe_edit_text(callback.message, "📚 <b>Индекс знаний</b>\n\n❌ Синхронизация не выполнена.", reply_markup=index_keyboard())
+            await safe_edit_text(callback.message, "📚 <b>Индекс знаний</b>\n\n❌ Синхронизация не выполнена.", reply_markup=index_keyboard(can_sync=True))
         return
     session.add(AuditLog(
         admin_id=callback.from_user.id,
@@ -346,10 +445,10 @@ async def sync_knowledge_index(
             "📚 <b>Индекс знаний</b>\n\n✅ Синхронизация завершена\n"
             f"Всего: {result.total}\nОбновлено: {result.created_or_updated}\n"
             f"Без изменений: {result.unchanged}\nУдалено: {result.deleted}",
-            reply_markup=index_keyboard(),
+            reply_markup=index_keyboard(can_sync=True),
         )
 
 
-@router.message(TestAIRetrieval.query)
+@router.message(TestAIRetrieval.query, HasPermission(Permission.AI_DIAGNOSTICS))
 async def search_text_only(message: Message) -> None:
     await message.answer("Отправьте тестовый запрос текстом.")

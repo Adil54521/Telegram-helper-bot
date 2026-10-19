@@ -28,8 +28,8 @@ from app.filters.admin import HasPermission
 
 
 router = Router(name="admin_buttons")
-router.callback_query.filter(HasPermission(Permission.CONTENT))
-router.message.filter(HasPermission(Permission.CONTENT))
+router.callback_query.filter(HasPermission(Permission.CONTENT_VIEW))
+router.message.filter(HasPermission(Permission.CONTENT_VIEW))
 
 MAX_BUTTON_TEXT_LENGTH = 128
 
@@ -42,7 +42,7 @@ async def allowed(
     return await PermissionService(
         session,
         settings,
-    ).has(uid, Permission.CONTENT)
+    ).has(uid, Permission.CONTENT_VIEW)
 
 
 async def guard(
@@ -56,6 +56,77 @@ async def guard(
     await cb.answer("Доступ запрещён", show_alert=True)
     return False
 
+async def can_modify_buttons(
+    user_id: int,
+    page_id: int,
+    session: AsyncSession,
+    settings: Settings,
+) -> bool:
+    permissions = PermissionService(session, settings)
+
+    if not await permissions.has(
+        user_id,
+        Permission.CONTENT_MANAGE,
+    ):
+        return False
+
+    page = await PageRepository(session).by_id(page_id)
+
+    if page is None:
+        return False
+
+    if page.published_revision_id is None:
+        return True
+
+    return await permissions.has(
+        user_id,
+        Permission.CONTENT_PUBLISH,
+    )
+
+async def guard_modify_buttons(
+    cb: CallbackQuery,
+    page_id: int,
+    session: AsyncSession,
+    settings: Settings,
+) -> bool:
+    if await can_modify_buttons(
+        cb.from_user.id,
+        page_id,
+        session,
+        settings,
+    ):
+        return True
+
+    await cb.answer(
+        "Недостаточно прав для изменения кнопок этой страницы",
+        show_alert=True,
+    )
+    return False
+
+async def guard_button_edit(
+    cb: CallbackQuery,
+    callback_data: ButtonCallback,
+    session: AsyncSession,
+    settings: Settings,
+) -> bool:
+    item = await CMSRepository(session).button(
+        callback_data.item_id,
+        callback_data.page_id,
+    )
+
+    if item is None:
+        await cb.answer(
+            "Кнопка не найдена",
+            show_alert=True,
+        )
+        return False
+
+    return await guard_modify_buttons(
+        cb,
+        item.page_id,
+        session,
+        settings,
+    )
 
 def kb(rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -238,9 +309,16 @@ async def show_list(
     cb: CallbackQuery,
     page_id: int,
     session: AsyncSession,
+    settings: Settings,
     page: int = 0,
 ) -> None:
     items = await CMSRepository(session).buttons(page_id)
+    can_edit = await can_modify_buttons(
+        cb.from_user.id,
+        page_id,
+        session,
+        settings,
+    )
     result=paginate(items,page)
 
     active_count = sum(1 for item in items if item.is_active)
@@ -268,8 +346,8 @@ async def show_list(
     if result.pages>1:
         rows.append([InlineKeyboardButton(text="⬅️",callback_data=ButtonCallback(action="list",page_id=page_id,page=max(0,result.page-1)).pack()),InlineKeyboardButton(text=f"{result.page+1} / {result.pages}",callback_data="noop"),InlineKeyboardButton(text="➡️",callback_data=ButtonCallback(action="list",page_id=page_id,page=min(result.pages-1,result.page+1)).pack())])
 
-    rows += [
-        [
+    if can_edit:
+        rows.append([
             InlineKeyboardButton(
                 text="➕ Добавить кнопку",
                 callback_data=ButtonCallback(
@@ -278,7 +356,9 @@ async def show_list(
                     page=result.page,
                 ).pack(),
             )
-        ],
+        ])
+
+    rows += [
         [
             InlineKeyboardButton(
                 text="⬅️ Назад",
@@ -321,6 +401,7 @@ async def page_buttons(
             cb,
             callback_data.page_id,
             session,
+            settings,
             callback_data.page,
         )
 
@@ -339,6 +420,7 @@ async def list_buttons(
             cb,
             callback_data.page_id,
             session,
+            settings,
             callback_data.page,
         )
 
@@ -364,6 +446,13 @@ async def open_button(
             "Кнопка не найдена",
             show_alert=True,
         )
+
+    can_edit = await can_modify_buttons(
+        cb.from_user.id,
+        item.page_id,
+        session,
+        settings,
+    )
 
     rows = [
         [
@@ -455,6 +544,20 @@ async def open_button(
         ],
     ]
 
+    if not can_edit:
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data=ButtonCallback(
+                        action="list",
+                        page_id=item.page_id,
+                        page=callback_data.page,
+                    ).pack(),
+                )
+            ]
+        ]
+
     ru = next((value for value in item.translations if value.language_code == LanguageCode.RU), None)
     kk = next((value for value in item.translations if value.language_code == LanguageCode.KK), None)
     ru_text = ru.text if ru else item.text
@@ -500,7 +603,7 @@ async def add(
     settings: Settings,
     state: FSMContext,
 ):
-    if not await guard(cb, session, settings):
+    if not await guard_modify_buttons(cb, callback_data.page_id, session, settings):
         return
 
     await state.set_state(AddButton.text)
@@ -826,33 +929,42 @@ async def preview_new(
         )
 
 
+
 @router.callback_query(
     AddButton.confirm,
-    ButtonCallback.filter(
-        F.action == "new_save"
-    ),
+    ButtonCallback.filter(F.action == "new_save"),
 )
 async def new_save(
     cb: CallbackQuery,
     session: AsyncSession,
     settings: Settings,
     state: FSMContext,
-):
-    if not await guard(
-        cb,
-        session,
-        settings,
-    ):
+) -> None:
+    if not await guard(cb, session, settings):
         await state.clear()
         return
 
     data = await state.get_data()
+    page_id = data.get("page_id")
 
-    item = await ButtonService(
-        session
-    ).create(
+    if not isinstance(page_id, int) or page_id <= 0:
+        await cb.answer(
+            "Некорректная страница",
+            show_alert=True,
+        )
+        return
+
+    if not await guard_modify_buttons(
+        cb,
+        page_id,
+        session,
+        settings,
+    ):
+        return
+
+    item = await ButtonService(session).create(
         cb.from_user.id,
-        data["page_id"],
+        page_id,
         data["text"],
         ButtonAction(data["action"]),
         data.get("target"),
@@ -865,6 +977,7 @@ async def new_save(
         cb,
         item.page_id,
         session,
+        settings,
         data.get("list_page",0),
     )
 
@@ -878,26 +991,32 @@ async def new_cancel(
     cb: CallbackQuery,
     state: FSMContext,
     session: AsyncSession,
+    settings: Settings,
 ):
-    data=await state.get_data();page_id=data.get("page_id")
-    page=data.get("list_page",0);await finish_wizard(state,"page_id","list_page","text","text_kk","action","target")
-    if page_id:await show_list(cb,page_id,session,page)
-    else:await cb.answer()
+    data = await state.get_data()
+    page_id = data.get("page_id")
+    page = data.get("list_page",0)
+    await finish_wizard(state, "page_id", "list_page", "text", "text_kk", "action", "target")
+    
+    if page_id:
+        await show_list(cb, page_id, session, settings, page)
+    else:
+        await cb.answer()
 
 @router.callback_query(ButtonCallback.filter(F.action=="new_back_action"))
-async def new_back_action(cb:CallbackQuery,state:FSMContext):await show_new_actions(cb.bot,state);await cb.answer()
+async def new_back_action(cb:CallbackQuery,state:FSMContext):
+    await show_new_actions(cb.bot,state)
+    await cb.answer()
 
 @router.callback_query(
     ButtonCallback.filter(
-        F.action.in_(
-            {
-                "up",
-                "down",
-                "toggle",
-                "delete_ask",
-                "delete_yes",
-            }
-        )
+        F.action.in_({
+            "up",
+            "down",
+            "toggle",
+            "delete_ask",
+            "delete_yes",
+        })
     )
 )
 async def mutate(
@@ -905,42 +1024,56 @@ async def mutate(
     callback_data: ButtonCallback,
     session: AsyncSession,
     settings: Settings,
-):
-    if not await guard(
+) -> None:
+    if not await guard(cb, session, settings):
+        return
+
+    item = await CMSRepository(session).button(
+        callback_data.item_id,
+        callback_data.page_id,
+    )
+
+    if not item:
+        await cb.answer(
+            "Кнопка не найдена",
+            show_alert=True,
+        )
+        return
+
+    if not await guard_modify_buttons(
         cb,
+        item.page_id,
         session,
         settings,
     ):
         return
 
-    item = await CMSRepository(
-        session
-    ).button(
-        callback_data.item_id, callback_data.page_id
-    )
-
-    if not item:
-        return await cb.answer(
-            "Кнопка не найдена",
-            show_alert=True,
-        )
-
     service = ButtonService(session)
+    action = callback_data.action
 
-    if callback_data.action in {
-        "up",
-        "down",
-    }:
+    if action in {"up", "down"}:
+        delta = -1 if action == "up" else 1
+
         await service.move(
             cb.from_user.id,
             item,
-            -1
-            if callback_data.action == "up"
-            else 1,
+            delta,
         )
-        moved_items=await CMSRepository(session).buttons(item.page_id);new_page=next((index//8 for index,value in enumerate(moved_items) if value.id==item.id),callback_data.page)
 
-        return await open_button(
+        moved_items = await CMSRepository(session).buttons(
+            item.page_id
+        )
+
+        new_page = next(
+            (
+                index // 8
+                for index, value in enumerate(moved_items)
+                if value.id == item.id
+            ),
+            callback_data.page,
+        )
+
+        await open_button(
             cb,
             ButtonCallback(
                 action="open",
@@ -951,15 +1084,16 @@ async def mutate(
             session,
             settings,
         )
+        return
 
-    if callback_data.action == "toggle":
+    if action == "toggle":
         await service.update(
             cb.from_user.id,
             item,
             is_active=not item.is_active,
         )
 
-        return await open_button(
+        await open_button(
             cb,
             ButtonCallback(
                 action="open",
@@ -970,56 +1104,62 @@ async def mutate(
             session,
             settings,
         )
+        return
 
-    if callback_data.action == "delete_ask":
+    if action == "delete_ask":
         if cb.message:
             await safe_edit_text(
                 cb.message,
-                f"⚠️ <b>Удалить кнопку «{html_text(item.text)}»?</b>\n\n"
-                "Это действие нельзя отменить.",
-                reply_markup=kb(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                text="🔴 Да, удалить",
-                                callback_data=ButtonCallback(
-                                    action="delete_yes",
-                                    item_id=item.id,
-                                    page_id=item.page_id,
-                                    page=callback_data.page,
-                                ).pack(),
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                text="⬅️ Отмена",
-                                callback_data=ButtonCallback(
-                                    action="open",
-                                    item_id=item.id,
-                                    page_id=item.page_id,
-                                    page=callback_data.page,
-                                ).pack(),
-                            )
-                        ],
-                    ]
+                (
+                    f"⚠️ <b>Удалить кнопку "
+                    f"«{html_text(item.text)}»?</b>\n\n"
+                    "Это действие нельзя отменить."
                 ),
+                reply_markup=kb([
+                    [
+                        InlineKeyboardButton(
+                            text="🔴 Да, удалить",
+                            callback_data=ButtonCallback(
+                                action="delete_yes",
+                                item_id=item.id,
+                                page_id=item.page_id,
+                                page=callback_data.page,
+                            ).pack(),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Отмена",
+                            callback_data=ButtonCallback(
+                                action="open",
+                                item_id=item.id,
+                                page_id=item.page_id,
+                                page=callback_data.page,
+                            ).pack(),
+                        )
+                    ],
+                ]),
             )
 
-        return await cb.answer()
+        await cb.answer()
+        return
 
-    page_id = item.page_id
+    if action == "delete_yes":
+        page_id = item.page_id
 
-    await service.delete(
-        cb.from_user.id,
-        item,
-    )
+        await service.delete(
+            cb.from_user.id,
+            item,
+        )
 
-    await show_list(
-        cb,
-        page_id,
-        session,
-        callback_data.page,
-    )
+        await show_list(
+            cb,
+            page_id,
+            session,
+            settings,
+            callback_data.page,
+        )
+        return
 
 
 @router.callback_query(
@@ -1040,8 +1180,9 @@ async def edit_text(
     settings: Settings,
     state: FSMContext,
 ):
-    if not await guard(
+    if not await guard_button_edit(
         cb,
+        callback_data,
         session,
         settings,
     ):
@@ -1087,8 +1228,9 @@ async def choose_existing_action(
     session: AsyncSession,
     settings: Settings,
 ):
-    if not await guard(
+    if not await guard_button_edit(
         cb,
+        callback_data,
         session,
         settings,
     ):
@@ -1151,6 +1293,14 @@ async def set_existing_action(
             "Кнопка не найдена",
             show_alert=True,
         )
+
+    if not await guard_modify_buttons(
+        cb,
+        item.page_id,
+        session,
+        settings,
+    ):
+        return
 
     action = callback_data.value
 
@@ -1301,6 +1451,14 @@ async def set_existing_page(
             show_alert=True,
         )
 
+    if not await guard_modify_buttons(
+        cb,
+        item.page_id,
+        session,
+        settings,
+    ):
+        return
+
     await ButtonService(
         session
     ).update(
@@ -1352,6 +1510,18 @@ async def save_edit(
         return await message.answer(
             "⚠️ Кнопка не найдена."
         )
+
+    if not await can_modify_buttons(
+        message.from_user.id,
+        item.page_id,
+        session,
+        settings,
+    ):
+        await state.clear()
+        await message.answer(
+            "Недостаточно прав для изменения кнопок этой страницы."
+        )
+        return
 
     if not message.text:
         return await message.answer(

@@ -156,6 +156,8 @@ class AdminAIHistoryTests(unittest.IsolatedAsyncioTestCase):
                 return_value=None
             )
 
+            service.role_has.return_value = False
+
             result = await permission_filter(
                 self.callback,
                 self.session,
@@ -166,6 +168,11 @@ class AdminAIHistoryTests(unittest.IsolatedAsyncioTestCase):
 
         service.role_for.assert_awaited_once_with(
             123456
+        )
+
+        service.role_has.assert_called_once_with(
+            None,
+            Permission.AI_HISTORY_VIEW,
         )
 
         self.repo.count.assert_not_awaited()

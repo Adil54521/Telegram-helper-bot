@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import AuditLog, PageAttachment
 from app.database.models.enums import MediaType
@@ -8,11 +8,61 @@ from app.services.pages import PageService
 
 class AttachmentService:
     def __init__(self, session: AsyncSession) -> None: self.session=session
-    async def create(self,page_id:int,actor:int,type_:MediaType,file_id:str,file_name:str|None,caption_ru:str|None=None,caption_kk:str|None=None)->PageAttachment:
-        page=await PageService(self.session).ensure_editable_draft(page_id,actor)
-        if not page or not page.draft_revision:raise ValueError("Страница не найдена")
-        item=PageAttachment(revision_id=page.draft_revision.id,type=type_,telegram_file_id=file_id,file_name=file_name,caption_ru=caption_ru,caption_kk=caption_kk,position=len(page.draft_revision.attachments))
-        self.session.add(item);await self.session.flush();self.session.add(AuditLog(admin_id=actor,action="ATTACHMENT_CREATED",entity_type="PageAttachment",entity_id=str(item.id),new_data={"page_id":page_id,"type":type_.value,"file_name":file_name}));return item
+    
+    async def create(
+        self,
+        page_id: int,
+        actor: int,
+        type_: MediaType,
+        file_id: str,
+        file_name: str | None,
+        caption_ru: str | None = None,
+        caption_kk: str | None = None,
+    ) -> PageAttachment:
+
+        page = await PageService(self.session).ensure_editable_draft(page_id, actor)
+
+        if not page or not page.draft_revision:
+            raise ValueError("Страница не найдена")
+
+        position = await self.session.scalar(
+            select(
+                func.coalesce(
+                    func.max(PageAttachment.position),
+                    -1,
+                )
+            ).where(PageAttachment.revision_id == page.draft_revision.id)
+        )
+
+        item = PageAttachment(
+            revision_id=page.draft_revision.id,
+            type=type_,
+            telegram_file_id=file_id,
+            file_name=file_name,
+            caption_ru=caption_ru,
+            caption_kk=caption_kk,
+            position=int(position) + 1,
+        )
+
+        self.session.add(item)
+        await self.session.flush()
+
+        self.session.add(
+            AuditLog(
+                admin_id=actor,
+                action="ATTACHMENT_CREATED",
+                entity_type="PageAttachment",
+                entity_id=str(item.id),
+                new_data={
+                    "page_id": page_id,
+                    "type": type_.value,
+                    "file_name": file_name,
+                },
+            )
+        )
+
+        return item
+
     async def update(self,item:PageAttachment,actor:int,**values)->None:
         old={k:getattr(item,k) for k in values}
         for k,v in values.items():setattr(item,k,v)

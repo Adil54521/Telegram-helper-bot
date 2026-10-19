@@ -226,19 +226,22 @@ async def open_page(callback: CallbackQuery, callback_data: AdminPageCallback, s
     else:
         publish_label = "🚀 Опубликовать"
 
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text=publish_label,
-                callback_data=AdminPageCallback(
-                    action="publish",
-                    page_id=page.id,
-                ).pack(),
-            )
-        ]
-    )
+    can_publish = await PermissionService(session, settings).has(callback.from_user.id, Permission.CONTENT_PUBLISH)
 
-    if page.key != "main":
+    if can_publish:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=publish_label,
+                    callback_data=AdminPageCallback(
+                        action="publish",
+                        page_id=page.id,
+                    ).pack(),
+                )
+            ]
+        )
+
+    if page.key != "main" and can_publish:
         rows.append(
             [
                 InlineKeyboardButton(
@@ -518,7 +521,7 @@ async def preview(callback: CallbackQuery, callback_data: AdminPageCallback, ses
     await callback.answer()
 
 
-@router.callback_query(AdminPageCallback.filter(F.action == "publish"))
+@router.callback_query(AdminPageCallback.filter(F.action == "publish"), HasPermission(Permission.CONTENT_PUBLISH))
 async def publish(callback: CallbackQuery, callback_data: AdminPageCallback, session: AsyncSession, settings: Settings, ai_service: AIService | None) -> None:
     if not await authorized(callback.from_user.id, session, settings):
         return await deny(callback)
@@ -531,7 +534,7 @@ async def publish(callback: CallbackQuery, callback_data: AdminPageCallback, ses
     await open_page(callback, AdminPageCallback(action="open", page_id=callback_data.page_id), session, settings)
 
 
-@router.callback_query(AdminPageCallback.filter(F.action.in_({"delete_ask", "delete_yes"})))
+@router.callback_query(AdminPageCallback.filter(F.action.in_({"delete_ask", "delete_yes"})), HasPermission(Permission.CONTENT_PUBLISH))
 async def delete_page(callback: CallbackQuery, callback_data: AdminPageCallback, session: AsyncSession, settings: Settings, ai_service: AIService | None) -> None:
     if not await authorized(callback.from_user.id, session, settings):
         return await deny(callback)

@@ -20,11 +20,11 @@ from app.utils.presentation import html_text, text_preview
 from app.utils.pagination import paginate
 from app.filters.admin import HasPermission
 router=Router(name="attachments")
-router.callback_query.filter(HasPermission(Permission.CONTENT))
-router.message.filter(HasPermission(Permission.CONTENT))
+router.callback_query.filter(HasPermission(Permission.CONTENT_MANAGE))
+router.message.filter(HasPermission(Permission.CONTENT_MANAGE))
 MAX_ATTACHMENT_BYTES=20_000_000
 def kb(r):return InlineKeyboardMarkup(inline_keyboard=r)
-async def ok(uid,s,c):return await PermissionService(s,c).has(uid,Permission.CONTENT)
+async def ok(uid,s,c):return await PermissionService(s,c).has(uid,Permission.CONTENT_MANAGE)
 async def guard(cb,s,c):
     if await ok(cb.from_user.id,s,c):return True
     await cb.answer("Доступ запрещён",show_alert=True);return False

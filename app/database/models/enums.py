@@ -5,6 +5,7 @@ class AdminRole(StrEnum):
     SUPER_ADMIN = "SUPER_ADMIN"
     ADMIN = "ADMIN"
     EDITOR = "EDITOR"
+    AI_HISTORY_VIEWER = "AI_HISTORY_VIEWER"
 
 
 class PageStatus(StrEnum):

@@ -1,12 +1,14 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+from app.callbacks import ChannelPostCallback
 from app.database.models import AuditLog, BotButton, BotButtonTranslation, BotPage, BotPageRevision, BotPageRevisionTranslation, PageAttachment, TelegramAttachmentReplacement, TelegramAutoDraftLink, TelegramContentPost, TelegramImportSettings, TelegramTopicPageMapping
 from app.database.models.enums import ButtonAction, LanguageCode, MediaType, PageStatus, TelegramContentStatus, TelegramProcessingMode
 from app.database.repositories.telegram_auto_drafts import TelegramAutoDraftRepository
 from app.services.pages import PageService
+from app.services.permissions import Permission
 from app.services.telegram_auto_drafts import AutoDraftCreated, TelegramAutoDraftService, _notify_created
 from app.services.telegram_content_parser import ParsedTelegramContent, TelegramContentConfidence, TelegramContentParseKind
 from app.handlers.channel import _should_notify_new_post
@@ -76,25 +78,115 @@ class AutoProcessingNotificationTests(unittest.IsolatedAsyncioTestCase):
 
 class AttachmentReviewPresentationTests(unittest.IsolatedAsyncioTestCase):
     async def test_material_review_shows_page_old_new_and_change_type(self):
-        old = PageAttachment(id=5, revision_id=7, type=MediaType.DOCUMENT, telegram_file_id="old", file_name="old.pdf")
-        pending = TelegramAttachmentReplacement(
-            id=9, source_post_id=2, page_id=3, attachment_id=5, base_revision_id=7,
-            media_type=MediaType.DOCUMENT, new_file_id="new", new_file_name="new.pdf",
-            source_message_id=20, status="REVIEW",
+        old = PageAttachment(
+            id=5,
+            revision_id=7,
+            type=MediaType.DOCUMENT,
+            telegram_file_id="old",
+            file_name="old.pdf",
         )
-        revision = BotPageRevision(id=7, page_id=3, title="Документы", text="Body")
-        page = BotPage(id=3, key="documents", draft_revision=revision)
-        callback = SimpleNamespace(message=object(), answer=AsyncMock())
+
+        pending = TelegramAttachmentReplacement(
+            id=9,
+            source_post_id=2,
+            page_id=3,
+            attachment_id=5,
+            base_revision_id=7,
+            media_type=MediaType.DOCUMENT,
+            new_file_id="new",
+            new_file_name="new.pdf",
+            source_message_id=20,
+            status="REVIEW",
+        )
+
+        revision = BotPageRevision(
+            id=7,
+            page_id=3,
+            title="Документы",
+            text="Body",
+        )
+
+        page = BotPage(
+            id=3,
+            key="documents",
+            draft_revision=revision,
+        )
+
+        callback = SimpleNamespace(
+            from_user=SimpleNamespace(id=123456),
+            message=object(),
+            answer=AsyncMock(),
+        )
+
         session = SimpleNamespace(get=AsyncMock(return_value=old))
-        with patch("app.handlers.admin.channel_posts.PageRepository.by_id", new=AsyncMock(return_value=page)), patch(
-            "app.handlers.admin.channel_posts.safe_edit_text", new=AsyncMock()
-        ) as edit:
-            await _render_file_pending(callback, session, pending)  # type: ignore[arg-type]
+        settings = MagicMock()
+
+        with (
+            patch("app.handlers.admin.channel_posts.PageRepository.by_id", new=AsyncMock(return_value=page)),
+            patch("app.handlers.admin.channel_posts.PermissionService") as permissions_class,
+            patch("app.handlers.admin.channel_posts.safe_edit_text", new_callable=AsyncMock) as edit,
+        ):
+            permissions_class.return_value.has = AsyncMock(return_value=True)
+
+            await _render_file_pending(callback, session, pending, settings)
+
         rendered = edit.await_args.args[1]
+
         self.assertIn("Документы", rendered)
         self.assertIn("old.pdf", rendered)
         self.assertIn("new.pdf", rendered)
         self.assertIn("Замена файла", rendered)
+
+        permissions_class.return_value.has.assert_awaited_once_with(123456, Permission.CONTENT_PUBLISH)
+        
+    async def test_editor_cannot_see_file_apply_button(self):
+        pending = TelegramAttachmentReplacement(
+            id=9,
+            source_post_id=2,
+            page_id=3,
+            attachment_id=5,
+            base_revision_id=7,
+            media_type=MediaType.DOCUMENT,
+            new_file_id="new",
+            new_file_name="new.pdf",
+            source_message_id=20,
+            status="REVIEW",
+        )
+
+        callback = SimpleNamespace(
+            from_user=SimpleNamespace(id=123456),
+            message=object(),
+            answer=AsyncMock(),
+        )
+
+        session = SimpleNamespace(get=AsyncMock(return_value=None))
+        settings = MagicMock()
+
+        with (
+            patch("app.handlers.admin.channel_posts.PageRepository.by_id", new=AsyncMock(return_value=None)),
+            patch("app.handlers.admin.channel_posts.PermissionService") as permissions_class,
+            patch("app.handlers.admin.channel_posts.safe_edit_text", new_callable=AsyncMock) as edit,
+        ):
+            permissions_class.return_value.has = AsyncMock(return_value=False)
+
+            await _render_file_pending(
+                callback,
+                session,
+                pending,
+                settings,
+            )
+
+        markup = edit.await_args.kwargs["reply_markup"]
+
+        actions = [
+            ChannelPostCallback.unpack(button.callback_data).action
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+
+        self.assertNotIn("file_apply", actions)
+        self.assertIn("file_reject", actions)
 
 
 class AutoDraftSchedulingTests(unittest.IsolatedAsyncioTestCase):
@@ -341,3 +433,48 @@ class AutoDraftPublishLinkTests(unittest.IsolatedAsyncioTestCase):
         recovered = next(call.args[0] for call in session.add.call_args_list if isinstance(call.args[0], TelegramAutoDraftLink))
         self.assertEqual((recovered.child_page_id, recovered.parent_page_id, recovered.source_post_id), (4, 2, 3))
         self.assertEqual(recovered.button_id, 9)
+
+    async def test_publish_queues_knowledge_sync(self):
+        page = BotPage(
+            id=20,
+            key="news",
+            status=PageStatus.DRAFT,
+            is_active=True,
+            draft_revision_id=30,
+        )
+
+        page.draft_revision = BotPageRevision(
+            id=30,
+            page_id=20,
+            title="Новости",
+            text="Текст новости",
+            translations=[
+                BotPageRevisionTranslation(
+                    language_code=LanguageCode.RU,
+                    title="Новости",
+                    text="Текст новости",
+                ),
+            ],
+        )
+
+        session = SimpleNamespace(
+            scalar=AsyncMock(return_value=None),
+            add=Mock(),
+            flush=AsyncMock(),
+        )
+
+        service = PageService(session)
+        service.repo = SimpleNamespace(
+            by_id=AsyncMock(return_value=page),
+        )
+
+        with patch.object(
+            service,
+            "_queue_knowledge_sync",
+            new_callable=AsyncMock,
+        ) as sync_mock:
+            await service.publish(page.id, 42)
+
+        sync_mock.assert_awaited_once()
+        self.assertEqual(page.status, PageStatus.PUBLISHED)
+        self.assertEqual(page.published_revision_id, 30)
